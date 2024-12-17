@@ -30,16 +30,37 @@ class GitNotification(NotificationBase):
     API/Client notification for setting a rich run statuses git issue comment (github/gitlab)
     """
 
+    @classmethod
+    def validate_params(cls, params):
+        git_repo = params.get("repo", None)
+        git_issue = params.get("issue", None)
+        git_merge_request = params.get("merge_request", None)
+        token = (
+            params.get("token", None)
+            or params.get("GIT_TOKEN", None)
+            or params.get("GITHUB_TOKEN", None)
+        )
+        if not git_repo:
+            raise ValueError("Parameter 'repo' is required for GitNotification")
+
+        if not token:
+            raise ValueError("Parameter 'token' is required for GitNotification")
+
+        if not git_issue and not git_merge_request:
+            raise ValueError(
+                "At least one of 'issue' or 'merge_request' is required for GitNotification"
+            )
+
     async def push(
         self,
         message: str,
-        severity: typing.Union[
-            mlrun.common.schemas.NotificationSeverity, str
+        severity: typing.Optional[
+            typing.Union[mlrun.common.schemas.NotificationSeverity, str]
         ] = mlrun.common.schemas.NotificationSeverity.INFO,
-        runs: typing.Union[mlrun.lists.RunList, list] = None,
-        custom_html: str = None,
-        alert: mlrun.common.schemas.AlertConfig = None,
-        event_data: mlrun.common.schemas.Event = None,
+        runs: typing.Optional[typing.Union[mlrun.lists.RunList, list]] = None,
+        custom_html: typing.Optional[typing.Optional[str]] = None,
+        alert: typing.Optional[mlrun.common.schemas.AlertConfig] = None,
+        event_data: typing.Optional[mlrun.common.schemas.Event] = None,
     ):
         git_repo = self.params.get("repo", None)
         git_issue = self.params.get("issue", None)
@@ -64,11 +85,11 @@ class GitNotification(NotificationBase):
     @staticmethod
     async def _pr_comment(
         message: str,
-        repo: str = None,
-        issue: int = None,
-        merge_request: int = None,
-        token: str = None,
-        server: str = None,
+        repo: typing.Optional[str] = None,
+        issue: typing.Optional[int] = None,
+        merge_request: typing.Optional[int] = None,
+        token: typing.Optional[str] = None,
+        server: typing.Optional[str] = None,
         gitlab: bool = False,
     ) -> str:
         """push comment message to Git system PR/issue

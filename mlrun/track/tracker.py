@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from abc import ABC, abstractmethod
-from typing import Any, Union
+from typing import Any, Optional, Union
 
 from mlrun.artifacts import Artifact, ModelArtifact
 from mlrun.execution import MLClientCtx
@@ -31,8 +31,9 @@ class Tracker(ABC):
     * Offline: Manually importing models and artifacts into an MLRun project using the `import_x` methods.
     """
 
+    @staticmethod
     @abstractmethod
-    def is_enabled(self) -> bool:
+    def is_enabled() -> bool:
         """
         Checks if tracker is enabled.
 
@@ -62,7 +63,7 @@ class Tracker(ABC):
         project: MlrunProject,
         reference_id: Any,
         function_name: str,
-        handler: str = None,
+        handler: Optional[str] = None,
         **kwargs,
     ) -> RunObject:
         """

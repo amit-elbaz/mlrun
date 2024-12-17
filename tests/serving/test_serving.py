@@ -84,10 +84,10 @@ ensemble_object_classification.routes = generate_test_routes_classification(
 )
 
 
-def generate_spec(graph, mode="sync", params={}):
+def generate_spec(graph, mode="sync", params=None):
     return {
         "version": "v2",
-        "parameters": params,
+        "parameters": params or {},
         "graph": graph,
         "load_mode": mode,
         "verbose": True,
@@ -609,11 +609,14 @@ def test_v2_health():
 
 
 def test_v2_mock():
-    host = create_graph_server(graph=RouterStep())
+    host = create_graph_server(
+        graph=RouterStep(),
+        function_uri="proj/abc",
+    )
     host.graph.add_route(
         "my", class_name=ModelTestingClass, model_path="", multiplier=100
     )
-    host.init_states(None, namespace=globals())
+    host.init_states(None, namespace=globals(), is_mock=True)
     host.init_object(globals())
     logger.info(host.to_yaml())
     resp = host.test("/v2/models/my/infer", testdata)
@@ -749,3 +752,12 @@ def test_mock_invoke():
 
     # return config valued
     mlrun.mlconf.mock_nuclio_deployment = mock_nuclio_config
+
+
+def test_add_route_exceeds_max_steps():
+    """Test adding a route when the maximum number of steps is exceeded."""
+    host = create_graph_server(graph=RouterStep())
+    max_steps = mlrun.serving.states.MAX_ALLOWED_STEPS
+    with pytest.raises(mlrun.errors.MLRunInvalidArgumentError):
+        for key in range(max_steps + 1):
+            host.graph.add_route(f"test_key_{key}", class_name=ModelTestingClass)

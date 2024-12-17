@@ -13,13 +13,14 @@
 # limitations under the License.
 
 import pathlib
+from typing import Optional
 
 from fsspec.implementations.dbfs import DatabricksFile, DatabricksFileSystem
 from fsspec.registry import get_filesystem_class
 
 import mlrun.errors
 
-from .base import DataStore, FileStats, makeDatastoreSchemaSanitizer
+from .base import DataStore, FileStats, make_datastore_schema_sanitizer
 
 
 class DatabricksFileBugFixed(DatabricksFile):
@@ -81,7 +82,9 @@ class DatabricksFileSystemDisableCache(DatabricksFileSystem):
 
 # dbfs objects will be represented with the following URL: dbfs://<path>
 class DBFSStore(DataStore):
-    def __init__(self, parent, schema, name, endpoint="", secrets: dict = None):
+    def __init__(
+        self, parent, schema, name, endpoint="", secrets: Optional[dict] = None
+    ):
         super().__init__(parent, name, schema, endpoint, secrets=secrets)
 
     @property
@@ -89,7 +92,7 @@ class DBFSStore(DataStore):
         """return fsspec file system object, if supported"""
         filesystem_class = get_filesystem_class(protocol=self.kind)
         if not self._filesystem:
-            self._filesystem = makeDatastoreSchemaSanitizer(
+            self._filesystem = make_datastore_schema_sanitizer(
                 cls=filesystem_class,
                 using_bucket=False,
                 **self.get_storage_options(),
@@ -130,11 +133,7 @@ class DBFSStore(DataStore):
                 "Append mode not supported for Databricks file system"
             )
         #  can not use append mode because it overrides data.
-        mode = "w"
-        if isinstance(data, bytes):
-            mode += "b"
-        elif not isinstance(data, str):
-            raise TypeError(f"Unknown data type {type(data)}")
+        data, mode = self._prepare_put_data(data, append)
         with self.filesystem.open(key, mode) as f:
             f.write(data)
 

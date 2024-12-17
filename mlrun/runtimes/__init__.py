@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# flake8: noqa  - this is until we take care of the F401 violations with respect to __all__ & sphinx
-
 __all__ = [
     "BaseRuntime",
     "KubejobRuntime",
@@ -26,23 +24,28 @@ __all__ = [
     "Spark3Runtime",
     "DatabricksRuntime",
     "KubeResource",
+    "ApplicationRuntime",
+    "MpiRuntimeV1",
 ]
+
+import typing
 
 from mlrun.runtimes.utils import resolve_spark_operator_version
 
+from ..common.runtimes.constants import MPIJobCRDVersions
 from .base import BaseRuntime, RunError, RuntimeClassMode  # noqa
-from .constants import MPIJobCRDVersions
 from .daskjob import DaskCluster  # noqa
 from .databricks_job.databricks_runtime import DatabricksRuntime
 from .kubejob import KubejobRuntime, KubeResource  # noqa
 from .local import HandlerRuntime, LocalRuntime  # noqa
-from .mpijob import MpiRuntimeContainer, MpiRuntimeV1, MpiRuntimeV1Alpha1  # noqa
+from .mpijob import MpiRuntimeV1  # noqa
 from .nuclio import (
     RemoteRuntime,
     ServingRuntime,
     new_v2_model_server,
     nuclio_init_hook,
 )
+from .nuclio.api_gateway import APIGateway
 from .nuclio.application import ApplicationRuntime
 from .nuclio.serving import serving_subkind
 from .remotesparkjob import RemoteSparkRuntime
@@ -55,7 +58,7 @@ from ..serving import MLModelServer, new_v1_model_server  # noqa isort: skip
 def new_model_server(
     name,
     model_class: str,
-    models: dict = None,
+    models: typing.Optional[dict] = None,
     filename="",
     protocol="",
     image="",
@@ -178,7 +181,7 @@ class RuntimeKinds:
         ]
 
     @staticmethod
-    def is_log_collectable_runtime(kind: str):
+    def is_log_collectable_runtime(kind: typing.Optional[str]):
         """
         whether log collector can collect logs for that runtime
         :param kind: kind name
@@ -189,13 +192,18 @@ class RuntimeKinds:
         if RuntimeKinds.is_local_runtime(kind):
             return False
 
-        if kind not in [
-            # dask implementation is different than other runtimes, because few runs can be run against the same runtime
-            # resource, so collecting logs on that runtime resource won't be correct, the way we collect logs for dask
-            # is by using `log_std` on client side after we execute the code against the cluster, as submitting the
-            # run with the dask client will return the run stdout. for more information head to `DaskCluster._run`
-            RuntimeKinds.dask
-        ]:
+        if (
+            kind
+            not in [
+                # dask implementation is different from other runtimes, because few runs can be run against the same
+                # runtime resource, so collecting logs on that runtime resource won't be correct, the way we collect
+                # logs for dask is by using `log_std` on client side after we execute the code against the cluster,
+                # as submitting the run with the dask client will return the run stdout.
+                # For more information head to `DaskCluster._run`.
+                RuntimeKinds.dask
+            ]
+            + RuntimeKinds.nuclio_runtimes()
+        ):
             return True
 
         return False
@@ -233,6 +241,10 @@ class RuntimeKinds:
         return kind not in [RuntimeKinds.spark, RuntimeKinds.remotespark]
 
     @staticmethod
+    def supports_from_notebook(kind):
+        return kind not in [RuntimeKinds.application]
+
+    @staticmethod
     def resolve_nuclio_runtime(kind: str, sub_kind: str):
         kind = kind.split(":")[0]
         if kind not in RuntimeKinds.nuclio_runtimes():
@@ -264,7 +276,7 @@ class RuntimeKinds:
 
 def get_runtime_class(kind: str):
     if kind == RuntimeKinds.mpijob:
-        return MpiRuntimeContainer.selector()
+        return MpiRuntimeV1
 
     if kind == RuntimeKinds.spark:
         return Spark3Runtime

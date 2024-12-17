@@ -18,7 +18,7 @@ from os import path
 sys.path.insert(0, "..")
 
 
-def current_version():
+def current_version() -> str:
     root = path.dirname(path.dirname(path.abspath(__file__)))
     with open(f"{root}/mlrun/__init__.py") as fp:
         for line in fp:
@@ -37,13 +37,12 @@ author = "Iguazio"
 
 master_doc = "contents"
 
-# The short X.Y version
-version = current_version()
-version = version[: version.rfind(".")]
-
 # The full version, including alpha/beta/rc tags
 release = current_version()
 
+# The short X.Y version
+version = release
+version = version[: version.rfind(".")]
 
 # -- General configuration ---------------------------------------------------
 
@@ -62,6 +61,7 @@ extensions = [
     "sphinx_design",
     "sphinx_reredirects",
     "versionwarning.extension",
+    "sphinxcontrib.mermaid",
 ]
 
 # Add any paths that contain templates here, relative to this directory.
@@ -79,7 +79,10 @@ language = "en"
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
 # This pattern also affects html_static_path and html_extra_path.
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "**.ipynb_checkpoints"]
+exclude_patterns = [
+    "_build",
+    "CONTRIBUTING.md",
+]
 
 source_suffix = {
     ".rst": "restructuredtext",
@@ -87,6 +90,8 @@ source_suffix = {
     ".myst": "myst-nb",
     ".md": "myst-nb",
 }
+
+nitpicky = False  # TODO: Change to `True`.
 
 # versionwarning configuration
 versionwarning_default_message = (
@@ -124,7 +129,7 @@ html_theme_options = {
     "home_page_in_toc": False,
     "repository_branch": "development",
     "show_navbar_depth": 1,
-    "extra_navbar": 'By <a href="https://www.iguazio.com/">Iguazio</a>',
+    # "extra_navbar": 'By <a href="https://www.iguazio.com/">Iguazio</a>',  # https://github.com/executablebooks/sphinx-book-theme/issues/810
     "extra_footer": "",
 }
 
@@ -144,19 +149,19 @@ myst_enable_extensions = [
     "substitution",
 ]
 myst_url_schemes = ("http", "https", "mailto")
-myst_heading_anchors = 2
-myst_all_links_external = True
+myst_heading_anchors = 5
+myst_all_links_external = False
+myst_xref_missing = "ignore"
 
 # These substitutions point to the relevant mlrun docs for the current CE version
 myst_substitutions = {
     "version": "version",
-    "ceversion": "v1.4.0",
-    "releasedocumentation": "docs.mlrun.org/en/v1.4.0/index.html",
+    "ceversion": "v1.7.0",
+    "releasedocumentation": "docs.mlrun.org/en/stable/index.html",
 }
 
 # If true, `todo` and `todoList` produce output, else they produce nothing.
 todo_include_todos = True
-
 # Add here external imports:
 autodoc_mock_imports = [
     "plotly",
@@ -164,13 +169,44 @@ autodoc_mock_imports = [
     "tensorflow",
     "tensorboard",
     "torch",
+    "tqdm",
     "lightgbm",
     "xgboost",
     "onnx",
 ]
 
-redirects = {"functions-architecture": "functions.html"}
+redirects = {
+    "runtimes/functions-architecture": "runtimes/functions.html",
+    "monitoring/initial-setup-configuration": "monitoring/model-monitoring-deployment.html",
+    "tutorials/05-batch-infer": "tutorials/06-batch-infer.html",
+    "tutorials/06-model-monitoring": "tutorials/05-model-monitoring.html",
+    "monitoring/models": "../model-monitoring/monitoring-models.html",
+    "monitoring/monitoring": "../model-monitoring.html",
+    "monitoring/monitoring-deployment": "../model-monitoring/model-monitoring-deployment.html",
+    "monitoring/legacy-model-monitoring": "../model-monitoring/legacy-model-monitoring.html",
+    "concepts/monitoring": "model-monitoring.html",
+    "monitoring/index": "../model-monitoring/index.html",
+    "monitoring/model-monitoring": "model-monitoring/index.html",
+}
+
 smartquotes = False
+
+linkcheck_ignore = [
+    # Ignore all the links to local files
+    r"^(?!https?://).*",
+    # linkcheck doesn't work well with relative paths on github which contain anchor, so ignore them
+    r"https:\/\/github.com/.*#.*$",
+    # open ai often blocks access and returns 403
+    r"https:\/\/platform\.openai\.com\/.*",
+    r"https:\/\/openai\.com\/.*",
+    # Single links to ignore
+    "./workflow.py",
+    "http://workflow.py",
+    "alerts-notifications",
+    "project.yaml",
+    "http://function.py",
+    "http://localhost:30040",
+]
 
 # -- Autosummary -------------------------------------------------------------
 

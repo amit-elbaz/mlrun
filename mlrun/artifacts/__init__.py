@@ -12,19 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# flake8: noqa  - this is until we take care of the F401 violations with respect to __all__ & sphinx
-
 # Don't remove this, used by sphinx documentation
-__all__ = ["get_model", "update_model"]
+__all__ = ["get_model", "update_model", "DocumentLoaderSpec", "MLRunLoader"]
 
-from .base import Artifact, ArtifactMetadata, ArtifactSpec, get_artifact_meta
+from .base import (
+    Artifact,
+    ArtifactMetadata,
+    ArtifactSpec,
+    DirArtifact,
+    get_artifact_meta,
+)
 from .dataset import DatasetArtifact, TableArtifact, update_dataset_meta
+from .document import DocumentArtifact, DocumentLoaderSpec, MLRunLoader
 from .manager import (
     ArtifactManager,
     ArtifactProducer,
     artifact_types,
     dict_to_artifact,
-    legacy_artifact_types,
 )
 from .model import ModelArtifact, get_model, update_model
-from .plots import BokehArtifact, ChartArtifact, PlotArtifact, PlotlyArtifact
+from .plots import PlotArtifact, PlotlyArtifact

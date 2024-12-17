@@ -12,18 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import Mock, PropertyMock, patch
 
 import numpy as np
 import pandas as pd
 import pytest
 
 import mlrun
+import mlrun.model_monitoring.applications.context as mm_context
 import mlrun.model_monitoring.applications.histogram_data_drift as histogram_data_drift
-import mlrun.utils
+import mlrun.serving
 from mlrun.common.model_monitoring.helpers import FeatureStats, pad_features_hist
-from mlrun.data_types.infer import DFDataInfer, default_num_bins
+from mlrun.data_types.infer import DFDataInfer, InferOptions, default_num_bins
 from mlrun.model_monitoring.helpers import calculate_inputs_statistics
+
+
+@contextmanager
+def mocked_graph_context_project() -> Iterator[None]:
+    with patch("mlrun.serving.GraphContext.project", PropertyMock) as project_mock:
+        project_mock.return_value = "proj-0"
+        yield
 
 
 def generate_data(
@@ -63,10 +74,7 @@ def plot_produce(context: mlrun.MLClientCtx):
 
     # Calculate statistics:
     sample_data_statistics = FeatureStats(
-        DFDataInfer.get_stats(
-            df=sample_data,
-            options=mlrun.data_types.infer.InferOptions.Histogram,
-        )
+        DFDataInfer.get_stats(df=sample_data, options=InferOptions.Histogram)
     )
     pad_features_hist(sample_data_statistics)
     inputs_statistics = FeatureStats(
@@ -75,29 +83,35 @@ def plot_produce(context: mlrun.MLClientCtx):
             inputs=inputs,
         )
     )
-
+    with patch(
+        "mlrun.get_current_project",
+        Mock(return_value=Mock(spec=mlrun.projects.project.MlrunProject)),
+    ):
+        with mocked_graph_context_project():
+            monitoring_context = mm_context.MonitoringApplicationContext(
+                application_name="histogram-data-drift",
+                event={},
+                artifacts_logger=context,
+            )
+            monitoring_context._feature_stats = inputs_statistics
+            monitoring_context._sample_df_stats = sample_data_statistics
     # Initialize the app
     application = histogram_data_drift.HistogramDataDriftApplication()
-    application.context = context
-
     # Calculate drift
     metrics_per_feature = application._compute_metrics_per_feature(
-        sample_df_stats=application.dict_to_histogram(sample_data_statistics),
-        feature_stats=application.dict_to_histogram(inputs_statistics),
+        monitoring_context=monitoring_context,
     )
     application._log_drift_artifacts(
-        sample_set_statistics=sample_data_statistics,
-        inputs_statistics=inputs_statistics,
+        monitoring_context=monitoring_context,
         metrics_per_feature=metrics_per_feature,
         log_json_artifact=False,
     )
 
 
-def test_plot_produce(tmp_path: Path) -> None:
+def test_plot_produce(rundb_mock, tmp_path: Path) -> None:
     # Run the plot production and logging:
     app_plot_run = mlrun.new_function().run(
-        artifact_path=str(tmp_path),
-        handler=plot_produce,
+        artifact_path=str(tmp_path), handler=plot_produce
     )
 
     # Validate the artifact was logged:
@@ -114,22 +128,13 @@ def test_plot_produce(tmp_path: Path) -> None:
 class TestCalculateInputsStatistics:
     _HIST = "hist"
     _DEFAULT_NUM_BINS = default_num_bins
-
-    @staticmethod
-    @pytest.fixture
-    def shared_feat() -> str:
-        return "orig_feat0"
-
-    @staticmethod
-    @pytest.fixture
-    def new_feat() -> str:
-        return "new_feat0"
+    _SHARED_FEATURE = "shared_feature"
 
     @classmethod
     @pytest.fixture
-    def sample_set_statistics(cls, shared_feat: str) -> dict:
+    def sample_set_statistics(cls) -> dict:
         return {
-            shared_feat: {
+            cls._SHARED_FEATURE: {
                 cls._HIST: [
                     [0, *list(np.random.randint(10, size=cls._DEFAULT_NUM_BINS)), 0],
                     [
@@ -141,25 +146,21 @@ class TestCalculateInputsStatistics:
             }
         }
 
-    @staticmethod
+    @classmethod
     @pytest.fixture
-    def inputs_df(shared_feat: str, new_feat: str) -> pd.DataFrame:
+    def inputs_df(cls) -> pd.DataFrame:
         return pd.DataFrame(
-            columns=[shared_feat, new_feat],
+            columns=[cls._SHARED_FEATURE, "feature_1"],
             data=np.random.randint(-15, 20, size=(9, 2)),
         )
 
-    @staticmethod
-    @pytest.fixture
-    def input_statistics(sample_set_statistics: dict, inputs_df: pd.DataFrame) -> dict:
-        return calculate_inputs_statistics(
+    @classmethod
+    def test_histograms_features(
+        cls, sample_set_statistics: dict, inputs_df: pd.DataFrame
+    ) -> None:
+        current_stats = calculate_inputs_statistics(
             sample_set_statistics=sample_set_statistics, inputs=inputs_df
         )
-
-    @classmethod
-    def test_histograms_length(
-        cls, shared_feat: str, new_feat: str, input_statistics: dict
-    ) -> None:
-        assert len(input_statistics[shared_feat][cls._HIST][0]) == len(
-            input_statistics[new_feat][cls._HIST][0]
-        ), "The lengths of the histograms do not match"
+        assert (
+            current_stats.keys() == sample_set_statistics.keys()
+        ), "Inputs statistics and the current statistics should have the same features"

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from copy import copy
+from typing import Optional
 
 import pandas as pd
 
@@ -21,7 +22,7 @@ import mlrun.frameworks
 from .artifacts import Artifact, dict_to_artifact
 from .config import config
 from .render import artifacts_to_html, runs_to_html
-from .utils import flatten, get_artifact_target, get_in, is_legacy_artifact
+from .utils import flatten, get_artifact_target, get_in
 
 list_header = [
     "project",
@@ -29,12 +30,14 @@ list_header = [
     "iter",
     "start",
     "state",
+    "kind",
     "name",
     "labels",
     "inputs",
     "parameters",
     "results",
     "artifacts",
+    "artifact_uris",
     "error",
 ]
 
@@ -56,12 +59,14 @@ class RunList(list):
                 get_in(run, "metadata.iteration", ""),
                 get_in(run, "status.start_time", ""),
                 get_in(run, "status.state", ""),
+                get_in(run, "step_kind", get_in(run, "kind", "")),
                 get_in(run, "metadata.name", ""),
                 get_in(run, "metadata.labels", ""),
                 get_in(run, "spec.inputs", ""),
                 get_in(run, "spec.parameters", ""),
                 get_in(run, "status.results", ""),
                 get_in(run, "status.artifacts", []),
+                get_in(run, "status.artifact_uris", {}),
                 get_in(run, "status.error", ""),
             ]
             if extend_iterations and iterations:
@@ -125,11 +130,11 @@ class RunList(list):
     def compare(
         self,
         hide_identical: bool = True,
-        exclude: list = None,
-        show: bool = None,
+        exclude: Optional[list] = None,
+        show: Optional[bool] = None,
         extend_iterations=True,
         filename=None,
-        colorscale: str = None,
+        colorscale: Optional[str] = None,
     ):
         """return/show parallel coordinates plot + table to compare between the list of runs
 
@@ -184,7 +189,7 @@ class ArtifactList(list):
             "uri": ["uri", "uri"],
         }
         for artifact in self:
-            fields_index = 0 if is_legacy_artifact(artifact) else 1
+            fields_index = 1
             row = [get_in(artifact, v[fields_index], "") for k, v in head.items()]
             artifact_uri = dict_to_artifact(artifact).uri
             last_index = len(row) - 1

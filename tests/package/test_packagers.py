@@ -101,7 +101,9 @@ def _setup_test(
         mlrun.mlconf.packagers.pack_tuples = True
 
     # Create a project for this tester:
-    project = mlrun.get_or_create_project(name="default", context=test_directory)
+    project = mlrun.get_or_create_project(
+        name="default", context=test_directory, allow_cross_project=True
+    )
 
     project.add_custom_packager(
         "mlrun.package.packagers.sklearn_packager.SklearnModelPack", is_mandatory=True

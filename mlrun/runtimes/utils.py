@@ -18,28 +18,26 @@ import os
 import re
 from io import StringIO
 from sys import stderr
+from typing import Optional
 
 import pandas as pd
-from kubernetes import client
 
 import mlrun
 import mlrun.common.constants
+import mlrun.common.constants as mlrun_constants
 import mlrun.common.schemas
 import mlrun.utils.regex
 from mlrun.artifacts import TableArtifact
+from mlrun.common.runtimes.constants import RunLabels
 from mlrun.config import config
 from mlrun.errors import err_to_str
 from mlrun.frameworks.parallel_coordinates import gen_pcp_plot
-from mlrun.runtimes.constants import RunLabels
 from mlrun.runtimes.generators import selector
 from mlrun.utils import get_in, helpers, logger, verify_field_regex
 
 
 class RunError(Exception):
     pass
-
-
-mlrun_key = "mlrun/"
 
 
 class _ContextStore:
@@ -150,7 +148,7 @@ def add_code_metadata(path=""):
 
 def results_to_iter(results, runspec, execution):
     if not results:
-        logger.error("got an empty results list in to_iter")
+        logger.error("Got an empty results list in to_iter")
         return
 
     iter = []
@@ -177,7 +175,7 @@ def results_to_iter(results, runspec, execution):
 
     if not iter:
         execution.set_state("completed", commit=True)
-        logger.warning("warning!, zero iteration results")
+        logger.warning("Warning!, zero iteration results")
         return
     if hasattr(pd, "json_normalize"):
         df = pd.json_normalize(iter).sort_values("iter")
@@ -192,10 +190,10 @@ def results_to_iter(results, runspec, execution):
     item, id = selector(results, criteria)
     if runspec.spec.selector and not id:
         logger.warning(
-            f"no best result selected, check selector ({criteria}) or results"
+            f"No best result selected, check selector ({criteria}) or results"
         )
     if id:
-        logger.info(f"best iteration={id}, used criteria {criteria}")
+        logger.info(f"Best iteration={id}, used criteria {criteria}")
     task = results[item] if id and results else None
     execution.log_iteration_results(id, summary, task)
 
@@ -278,43 +276,6 @@ def get_item_name(item, attr="name"):
         return item.get(attr)
     else:
         return getattr(item, attr, None)
-
-
-def apply_kfp(modify, cop, runtime):
-    modify(cop)
-
-    # Have to do it here to avoid circular dependencies
-    from .pod import AutoMountType
-
-    if AutoMountType.is_auto_modifier(modify):
-        runtime.spec.disable_auto_mount = True
-
-    api = client.ApiClient()
-    for k, v in cop.pod_labels.items():
-        runtime.metadata.labels[k] = v
-    for k, v in cop.pod_annotations.items():
-        runtime.metadata.annotations[k] = v
-    if cop.container.env:
-        env_names = [
-            e.name if hasattr(e, "name") else e["name"] for e in runtime.spec.env
-        ]
-        for e in api.sanitize_for_serialization(cop.container.env):
-            name = e["name"]
-            if name in env_names:
-                runtime.spec.env[env_names.index(name)] = e
-            else:
-                runtime.spec.env.append(e)
-                env_names.append(name)
-        cop.container.env.clear()
-
-    if cop.volumes and cop.container.volume_mounts:
-        vols = api.sanitize_for_serialization(cop.volumes)
-        mounts = api.sanitize_for_serialization(cop.container.volume_mounts)
-        runtime.spec.update_vols_and_mounts(vols, mounts)
-        cop.volumes.clear()
-        cop.container.volume_mounts.clear()
-
-    return runtime
 
 
 def verify_limits(
@@ -410,10 +371,10 @@ def generate_resources(mem=None, cpu=None, gpus=None, gpu_type="nvidia.com/gpu")
 
 
 def get_func_selector(project, name=None, tag=None):
-    s = [f"{mlrun_key}project={project}"]
+    s = [f"{mlrun_constants.MLRunInternalLabels.project}={project}"]
     if name:
-        s.append(f"{mlrun_key}function={name}")
-        s.append(f"{mlrun_key}tag={tag or 'latest'}")
+        s.append(f"{mlrun_constants.MLRunInternalLabels.function}={name}")
+        s.append(f"{mlrun_constants.MLRunInternalLabels.tag}={tag or 'latest'}")
     return s
 
 
@@ -472,10 +433,11 @@ def enrich_function_from_dict(function, function_dict):
 
 def enrich_run_labels(
     labels: dict,
-    labels_to_enrich: list[RunLabels] = None,
+    labels_to_enrich: Optional[list[RunLabels]] = None,
 ):
     labels_enrichment = {
         RunLabels.owner: os.environ.get("V3IO_USERNAME") or getpass.getuser(),
+        # TODO: remove this in 1.9.0
         RunLabels.v3io_user: os.environ.get("V3IO_USERNAME"),
     }
     labels_to_enrich = labels_to_enrich or RunLabels.all()
@@ -484,3 +446,37 @@ def enrich_run_labels(
         if label.value not in labels and enrichment:
             labels[label.value] = enrichment
     return labels
+
+
+def resolve_node_selectors(
+    project_node_selector: dict, instance_node_selector: dict
+) -> dict:
+    config_node_selector = mlrun.mlconf.get_default_function_node_selector()
+    if project_node_selector or config_node_selector:
+        mlrun.utils.logger.debug(
+            "Enriching node selector from project and mlrun config",
+            project_node_selector=project_node_selector,
+            config_node_selector=config_node_selector,
+        )
+        return mlrun.utils.helpers.merge_dicts_with_precedence(
+            config_node_selector,
+            project_node_selector,
+            instance_node_selector,
+        )
+    return instance_node_selector
+
+
+def enrich_gateway_timeout_annotations(annotations: dict, gateway_timeout: int):
+    """
+    Set gateway proxy connect/read/send timeout annotations
+    :param annotations:     The annotations to enrich
+    :param gateway_timeout: The timeout to set
+    """
+    if not gateway_timeout:
+        return
+    gateway_timeout_str = str(gateway_timeout)
+    annotations["nginx.ingress.kubernetes.io/proxy-connect-timeout"] = (
+        gateway_timeout_str
+    )
+    annotations["nginx.ingress.kubernetes.io/proxy-read-timeout"] = gateway_timeout_str
+    annotations["nginx.ingress.kubernetes.io/proxy-send-timeout"] = gateway_timeout_str

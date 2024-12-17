@@ -11,14 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import typing
 import warnings
 
 import mlrun.common.schemas
 import mlrun.db
 import mlrun.errors
+from mlrun_pipelines.common.ops import build_op
 
-from ..kfpops import build_op
 from ..model import RunObject
 from .pod import KubeResource
 
@@ -75,7 +75,7 @@ class KubejobRuntime(KubeResource):
         self,
         image="",
         base_image=None,
-        commands: list = None,
+        commands: typing.Optional[list] = None,
         secret=None,
         source=None,
         extra=None,
@@ -142,12 +142,12 @@ class KubejobRuntime(KubeResource):
 
     def deploy(
         self,
-        watch=True,
-        with_mlrun=None,
-        skip_deployed=False,
-        is_kfp=False,
-        mlrun_version_specifier=None,
-        builder_env: dict = None,
+        watch: bool = True,
+        with_mlrun: typing.Optional[bool] = None,
+        skip_deployed: bool = False,
+        is_kfp: bool = False,
+        mlrun_version_specifier: typing.Optional[bool] = None,
+        builder_env: typing.Optional[dict] = None,
         show_on_failure: bool = False,
         force_build: bool = False,
     ) -> bool:
@@ -189,7 +189,7 @@ class KubejobRuntime(KubeResource):
         self,
         image=None,
         base_image=None,
-        commands: list = None,
+        commands: typing.Optional[list] = None,
         secret_name="",
         with_mlrun=True,
         skip_deployed=False,

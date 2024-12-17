@@ -18,6 +18,7 @@ import shutil
 import unittest.mock
 
 import pandas
+import pytest
 
 import mlrun
 import mlrun.artifacts
@@ -31,13 +32,10 @@ results_dir = (pathlib.Path(conftest.results) / "artifacts").absolute()
 class TestArtifacts(tests.integration.sdk_api.base.TestMLRunIntegration):
     extra_env = {"MLRUN_HTTPDB__REAL_PATH": "/"}
 
-    def setup_method(self, method, extra_env=None):
-        super().setup_method(method, extra_env=self.extra_env)
-
     def test_artifacts(self):
         db = mlrun.get_run_db()
         prj, tree, key, body = "p9", "t19", "k802", "tomato"
-        mlrun.get_or_create_project(prj, "./")
+        mlrun.get_or_create_project(prj, "./", allow_cross_project=True)
         artifact = mlrun.artifacts.Artifact(key, body, target_path="/a.txt")
 
         db.store_artifact(key, artifact, tree=tree, project=prj)
@@ -60,7 +58,7 @@ class TestArtifacts(tests.integration.sdk_api.base.TestMLRunIntegration):
 
     def test_list_artifacts_filter_by_kind(self):
         prj, tree, key, body = "p9", "t19", "k802", "tomato"
-        mlrun.get_or_create_project(prj, context="./")
+        mlrun.get_or_create_project(prj, context="./", allow_cross_project=True)
         model_artifact = mlrun.artifacts.model.ModelArtifact(
             key, body, target_path="/a.txt"
         )
@@ -156,3 +154,44 @@ class TestArtifacts(tests.integration.sdk_api.base.TestMLRunIntegration):
         assert os.path.exists(artifact_url)
         # verify that the temp path was deleted after the import
         assert not os.path.exists(temp_local_path)
+
+    def test_retrieve_an_artifact_with_no_tag(self):
+        """
+        Test artifact retrieval when no tag is explicitly set.
+        Verifies:
+        1. The first artifact has no tag.
+        2. The second artifact is tagged as 'latest'.
+        3. Attempting to retrieve the untagged artifact using its URI without the UID raises an error.
+        4. The artifact with no tag can be retrieved successfully using its full URI.
+        """
+        project = mlrun.new_project("log-mod")
+
+        # Log two models without specifying a tag
+        project.log_model(
+            "mymod",
+            body=b"123",
+            model_file="model.pkl",
+            extra_data={"kk": b"456"},
+            artifact_path=results_dir,
+        )
+
+        project.log_model(
+            "mymod",
+            body=b"123",
+            model_file="model.pkl",
+            extra_data={"kk": b"456"},
+            artifact_path=results_dir,
+        )
+        artifacts = project.list_artifacts().to_objects()
+        assert len(artifacts) == 2, f"Expected 2 artifacts, found {len(artifacts)}"
+
+        assert artifacts[1].tag == "latest"
+        assert artifacts[0].tag is None
+
+        # Assert attempting to retrieve an artifact with a URI missing the UID raises the expected error
+        uri_without_uid = artifacts[0].uri.split("^")[0]
+        with pytest.raises(mlrun.errors.MLRunNotFoundError):
+            project.get_store_resource(uri_without_uid)
+
+        # Ensure we can retrieve the untagged artifact by its URI
+        assert project.get_store_resource(artifacts[0].uri)

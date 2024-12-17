@@ -24,16 +24,17 @@ from datetime import datetime
 from os import environ
 from typing import Any, Optional, Union
 
-import pydantic.error_wrappers
+import pydantic.v1.error_wrappers
 
 import mlrun
+import mlrun.common.constants as mlrun_constants
 import mlrun.common.schemas.notification
+import mlrun.utils.regex
 
 from .utils import (
     dict_to_json,
     dict_to_yaml,
     get_artifact_target,
-    is_legacy_artifact,
     logger,
     template_artifact_path,
 )
@@ -73,7 +74,10 @@ class ModelObj:
 
     @mlrun.utils.filter_warnings("ignore", FutureWarning)
     def to_dict(
-        self, fields: list = None, exclude: list = None, strip: bool = False
+        self,
+        fields: Optional[list] = None,
+        exclude: Optional[list] = None,
+        strip: bool = False,
     ) -> dict:
         """
         Convert the object to a dict
@@ -113,6 +117,8 @@ class ModelObj:
                 # If one of the attributes is a third party object that has to_dict method (such as k8s objects), then
                 # add it to the object's _fields_to_serialize attribute and handle it in the _serialize_field method.
                 if hasattr(field_value, "to_dict"):
+                    # TODO: Allow passing fields to exclude from the parent object to the child object
+                    #  e.g.: run.to_dict(exclude=["status.artifacts"])
                     field_value = field_value.to_dict(strip=strip)
                     if self._is_valid_field_value_for_serialization(
                         field_name, field_value, strip
@@ -140,7 +146,7 @@ class ModelObj:
         self._apply_enrichment_before_to_dict_completion(struct, strip=strip)
         return struct
 
-    def _resolve_initial_to_dict_fields(self, fields: list = None) -> list:
+    def _resolve_initial_to_dict_fields(self, fields: Optional[list] = None) -> list:
         """
         Resolve fields to be used in to_dict method.
         If fields is None, use `_dict_fields` attribute of the object.
@@ -183,7 +189,7 @@ class ModelObj:
         self,
         struct: dict,
         method: typing.Callable,
-        fields: typing.Union[list, set] = None,
+        fields: Optional[typing.Union[list, set]] = None,
         strip: bool = False,
     ) -> dict:
         for field_name in fields:
@@ -195,14 +201,14 @@ class ModelObj:
         return struct
 
     def _serialize_field(
-        self, struct: dict, field_name: str = None, strip: bool = False
+        self, struct: dict, field_name: Optional[str] = None, strip: bool = False
     ) -> typing.Any:
         # We pull the field from self and not from struct because it was excluded from the struct when looping over
         # the fields to save.
         return getattr(self, field_name, None)
 
     def _enrich_field(
-        self, struct: dict, field_name: str = None, strip: bool = False
+        self, struct: dict, field_name: Optional[str] = None, strip: bool = False
     ) -> typing.Any:
         # We first try to pull from struct because the field might have been already serialized and if not,
         # we pull from self
@@ -214,7 +220,9 @@ class ModelObj:
         return struct
 
     @classmethod
-    def from_dict(cls, struct=None, fields=None, deprecated_fields: dict = None):
+    def from_dict(
+        cls, struct=None, fields=None, deprecated_fields: Optional[dict] = None
+    ):
         """create an object from a python dictionary"""
         struct = {} if struct is None else struct
         deprecated_fields = deprecated_fields or {}
@@ -429,7 +437,7 @@ class Credentials(ModelObj):
 
     def __init__(
         self,
-        access_key: str = None,
+        access_key: Optional[str] = None,
     ):
         self.access_key = access_key
 
@@ -437,6 +445,7 @@ class Credentials(ModelObj):
 class BaseMetadata(ModelObj):
     _default_fields_to_strip = ModelObj._default_fields_to_strip + [
         "hash",
+        "uid",
         # Below are environment specific fields, no need to keep when stripping
         "namespace",
         "project",
@@ -459,10 +468,12 @@ class BaseMetadata(ModelObj):
         categories=None,
         updated=None,
         credentials=None,
+        uid=None,
     ):
         self.name = name
         self.tag = tag
         self.hash = hash
+        self.uid = uid
         self.namespace = namespace
         self.project = project or ""
         self.labels = labels or {}
@@ -486,7 +497,7 @@ class ImageBuilder(ModelObj):
 
     def __init__(
         self,
-        functionSourceCode=None,
+        functionSourceCode=None,  # noqa: N803 - should be "snake_case", kept for BC
         source=None,
         image=None,
         base_image=None,
@@ -499,7 +510,7 @@ class ImageBuilder(ModelObj):
         origin_filename=None,
         with_mlrun=None,
         auto_build=None,
-        requirements: list = None,
+        requirements: Optional[list] = None,
         extra_args=None,
         builder_env=None,
         source_code_target_dir=None,
@@ -548,7 +559,7 @@ class ImageBuilder(ModelObj):
         self,
         image="",
         base_image=None,
-        commands: list = None,
+        commands: Optional[list] = None,
         secret=None,
         source=None,
         extra=None,
@@ -678,14 +689,36 @@ class ImageBuilder(ModelObj):
 
 
 class Notification(ModelObj):
-    """Notification specification"""
+    """Notification object
+
+    :param kind: notification implementation kind - slack, webhook, etc. See
+        :py:class:`mlrun.common.schemas.notification.NotificationKind`
+    :param name: for logging and identification
+    :param message: message content in the notification
+    :param severity: severity to display in the notification
+    :param when: list of statuses to trigger the notification: 'running', 'completed', 'error'
+    :param condition: optional condition to trigger the notification, a jinja2 expression that can use run data
+                      to evaluate if the notification should be sent in addition to the 'when' statuses.
+                      e.g.: '{{ run["status"]["results"]["accuracy"] < 0.9}}'
+    :param params: Implementation specific parameters for the notification implementation (e.g. slack webhook url,
+                   git repository details, etc.)
+    :param secret_params: secret parameters for the notification implementation, same as params but will be stored
+                          in a k8s secret and passed as a secret reference to the implementation.
+    :param status: notification status - pending, sent, error
+    :param sent_time: time the notification was sent
+    :param reason: failure reason if the notification failed to send
+    """
 
     def __init__(
         self,
-        kind=None,
+        kind: mlrun.common.schemas.notification.NotificationKind = (
+            mlrun.common.schemas.notification.NotificationKind.slack
+        ),
         name=None,
         message=None,
-        severity=None,
+        severity: mlrun.common.schemas.notification.NotificationSeverity = (
+            mlrun.common.schemas.notification.NotificationSeverity.INFO
+        ),
         when=None,
         condition=None,
         secret_params=None,
@@ -694,12 +727,10 @@ class Notification(ModelObj):
         sent_time=None,
         reason=None,
     ):
-        self.kind = kind or mlrun.common.schemas.notification.NotificationKind.slack
+        self.kind = kind
         self.name = name or ""
         self.message = message or ""
-        self.severity = (
-            severity or mlrun.common.schemas.notification.NotificationSeverity.INFO
-        )
+        self.severity = severity
         self.when = when or ["completed"]
         self.condition = condition or ""
         self.secret_params = secret_params or {}
@@ -713,7 +744,7 @@ class Notification(ModelObj):
     def validate_notification(self):
         try:
             mlrun.common.schemas.notification.Notification(**self.to_dict())
-        except pydantic.error_wrappers.ValidationError as exc:
+        except pydantic.v1.error_wrappers.ValidationError as exc:
             raise mlrun.errors.MLRunInvalidArgumentError(
                 "Invalid notification object"
             ) from exc
@@ -728,6 +759,47 @@ class Notification(ModelObj):
             raise mlrun.errors.MLRunInvalidArgumentError(
                 "Notification params size exceeds max size of 1 MB"
             )
+
+    def validate_notification_params(self, default_notification_params=None):
+        default_notification_params = default_notification_params or {}
+        notification_type = mlrun.utils.notifications.NotificationTypes(self.kind)
+        notification_class = notification_type.get_notification()
+        secret_params = self.secret_params or {}
+        params = self.params or {}
+        default_params = default_notification_params.get(notification_type, {})
+        params = notification_class.enrich_default_params(params, default_params)
+        # if the secret_params are already masked - no need to validate
+        params_secret = secret_params.get("secret", "")
+        if params_secret:
+            if len(secret_params) > 1:
+                raise mlrun.errors.MLRunInvalidArgumentError(
+                    "When the 'secret' key is present, 'secret_params' should not contain any other keys."
+                )
+            return
+
+        if not secret_params and not params:
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                "Both 'secret_params' and 'params' are empty, at least one must be defined."
+            )
+
+        notification_class.validate_params(secret_params | params)
+
+    def enrich_unmasked_secret_params_from_project_secret(self):
+        """
+        Fill the notification secret params from the project secret.
+        We are using this function instead of unmask_secret_params_from_project_secret when we run inside the
+        workflow runner pod that doesn't have access to the k8s secrets (but have access to the project secret)
+        """
+        secret = self.secret_params.get("secret")
+        if secret:
+            secret_value = mlrun.get_secret_or_env(secret)
+            if secret_value:
+                try:
+                    self.secret_params = json.loads(secret_value)
+                except ValueError as exc:
+                    raise mlrun.errors.MLRunValueError(
+                        "Failed to parse secret value"
+                    ) from exc
 
     @staticmethod
     def validate_notification_uniqueness(notifications: list["Notification"]):
@@ -765,6 +837,14 @@ class RunMetadata(ModelObj):
     @iteration.setter
     def iteration(self, iteration):
         self._iteration = iteration
+
+    def is_workflow_runner(self):
+        if not self.labels:
+            return False
+        return (
+            self.labels.get(mlrun_constants.MLRunInternalLabels.job_type, "")
+            == "workflow-runner"
+        )
 
 
 class HyperParamStrategies:
@@ -861,6 +941,8 @@ class RunSpec(ModelObj):
         returns=None,
         notifications=None,
         state_thresholds=None,
+        reset_on_run=None,
+        node_selector=None,
     ):
         # A dictionary of parsing configurations that will be read from the inputs the user set. The keys are the inputs
         # keys (parameter names) and the values are the type hint given in the input keys after the colon.
@@ -897,9 +979,11 @@ class RunSpec(ModelObj):
         self.allow_empty_resources = allow_empty_resources
         self._notifications = notifications or []
         self.state_thresholds = state_thresholds or {}
+        self.reset_on_run = reset_on_run
+        self.node_selector = node_selector or {}
 
     def _serialize_field(
-        self, struct: dict, field_name: str = None, strip: bool = False
+        self, struct: dict, field_name: Optional[str] = None, strip: bool = False
     ) -> Optional[str]:
         # We pull the field from self and not from struct because it was excluded from the struct
         if field_name == "handler":
@@ -1188,6 +1272,8 @@ class RunSpec(ModelObj):
 class RunStatus(ModelObj):
     """Run status"""
 
+    _default_fields_to_strip = ModelObj._default_fields_to_strip + ["artifacts"]
+
     def __init__(
         self,
         state=None,
@@ -1201,8 +1287,9 @@ class RunStatus(ModelObj):
         last_update=None,
         iterations=None,
         ui_url=None,
-        reason: str = None,
-        notifications: dict[str, Notification] = None,
+        reason: Optional[str] = None,
+        notifications: Optional[dict[str, Notification]] = None,
+        artifact_uris: Optional[dict[str, str]] = None,
     ):
         self.state = state or "created"
         self.status_text = status_text
@@ -1210,13 +1297,80 @@ class RunStatus(ModelObj):
         self.host = host
         self.commit = commit
         self.results = results
-        self.artifacts = artifacts
+        self._artifacts = artifacts
         self.start_time = start_time
         self.last_update = last_update
         self.iterations = iterations
         self.ui_url = ui_url
         self.reason = reason
         self.notifications = notifications or {}
+        # Artifact key -> URI mapping, since the full artifacts are not stored in the runs DB table
+        self._artifact_uris = artifact_uris or {}
+
+    @classmethod
+    def from_dict(
+        cls, struct=None, fields=None, deprecated_fields: Optional[dict] = None
+    ):
+        deprecated_fields = {
+            # Set artifacts as deprecated for lazy loading
+            "artifacts": "artifact_uris"
+        }
+        return super().from_dict(
+            struct, fields=fields, deprecated_fields=deprecated_fields
+        )
+
+    @property
+    def artifacts(self):
+        """
+        Artifacts are lazy loaded to reduce memory consumption.
+        We keep artifact_uris (key -> store URI dictionary) to be able to get the run artifacts easily.
+        If the artifact is not already in the cache, we get it from the store (DB).
+        :return: List of artifact dictionaries
+        """
+        self._artifacts = self._artifacts or []
+        existing_artifact_keys = {
+            artifact["metadata"]["key"] for artifact in self._artifacts
+        }
+        for key, uri in self.artifact_uris.items():
+            if key not in existing_artifact_keys:
+                artifact = mlrun.datastore.get_store_resource(uri)
+                self._artifacts.append(artifact.to_dict())
+        return self._artifacts
+
+    @artifacts.setter
+    def artifacts(self, artifacts):
+        self._artifacts = artifacts
+
+    @property
+    def artifact_uris(self):
+        return self._artifact_uris
+
+    @artifact_uris.setter
+    def artifact_uris(self, artifact_uris):
+        resolved_artifact_uris = {}
+        if isinstance(artifact_uris, list):
+            # artifact_uris is the deprecated list of artifacts - convert to new form
+            for artifact in artifact_uris:
+                if isinstance(artifact, dict):
+                    artifact = mlrun.artifacts.dict_to_artifact(artifact)
+                resolved_artifact_uris[artifact.key] = artifact.uri
+        else:
+            resolved_artifact_uris = artifact_uris
+
+        self._artifact_uris = resolved_artifact_uris
+
+    def is_failed(self) -> Optional[bool]:
+        """
+        This method returns whether a run has failed.
+        Returns none if state has yet to be defined. callee is responsible for handling None.
+        (e.g wait for state to be defined)
+        """
+        if not self.state:
+            return None
+        return self.state.casefold() in [
+            mlrun.run.RunStatuses.failed.casefold(),
+            mlrun.run.RunStatuses.error.casefold(),
+        ]
 
 
 class RunTemplate(ModelObj):
@@ -1256,7 +1410,7 @@ class RunTemplate(ModelObj):
 
             task.with_input("data", "/file-dir/path/to/file")
             task.with_input("data", "s3://<bucket>/path/to/file")
-            task.with_input("data", "v3io://[<remote-host>]/<data-container>/path/to/file")
+            task.with_input("data", "v3io://<data-container>/path/to/file")
         """
         if not self.spec.inputs:
             self.spec.inputs = {}
@@ -1413,33 +1567,63 @@ class RunObject(RunTemplate):
     @property
     def error(self) -> str:
         """error string if failed"""
-        if self.status:
+        if (
+            self.status
+            and self.status.state
+            in mlrun.common.runtimes.constants.RunStates.error_and_abortion_states()
+        ):
             unknown_error = ""
             if (
                 self.status.state
-                in mlrun.runtimes.constants.RunStates.abortion_states()
+                in mlrun.common.runtimes.constants.RunStates.abortion_states()
             ):
                 unknown_error = "Run was aborted"
 
-            elif self.status.state in mlrun.runtimes.constants.RunStates.error_states():
+            elif (
+                self.status.state
+                in mlrun.common.runtimes.constants.RunStates.error_states()
+            ):
                 unknown_error = "Unknown error"
 
             return (
                 self.status.error
-                or self.status.reason
                 or self.status.status_text
+                or self.status.reason
                 or unknown_error
             )
         return ""
 
-    def output(self, key):
-        """return the value of a specific result or artifact by key"""
+    def output(self, key: str):
+        """
+        Return the value of a specific result or artifact by key.
+
+        This method waits for the outputs to complete and retrieves the value corresponding to the provided key.
+        If the key exists in the results, it returns the corresponding result value.
+        If not found in results, it attempts to fetch the artifact by key (cached in the run status).
+        If the artifact is not found, it tries to fetch the artifact URI by key.
+        If no artifact or result is found for the key, returns None.
+
+        :param key: The key of the result or artifact to retrieve.
+        :return: The value of the result or the artifact URI corresponding to the key, or None if not found.
+        """
         self._outputs_wait_for_completion()
+
+        # Check if the key exists in results and return the result value
         if self.status.results and key in self.status.results:
-            return self.status.results.get(key)
+            return self.status.results[key]
+
+        # Artifacts are usually cached in the run object under `status.artifacts`. However, the artifacts are not
+        # stored in the DB as part of the run. The server may enrich the run with the artifacts or provide
+        # `status.artifact_uris` instead. See mlrun.common.formatters.run.RunFormat.
+        # When running locally - `status.artifact_uri` does not exist in the run.
+        # When listing runs - `status.artifacts` does not exist in the run.
         artifact = self._artifact(key)
         if artifact:
             return get_artifact_target(artifact, self.metadata.project)
+
+        if self.status.artifact_uris and key in self.status.artifact_uris:
+            return self.status.artifact_uris[key]
+
         return None
 
     @property
@@ -1452,26 +1636,50 @@ class RunObject(RunTemplate):
 
     @property
     def outputs(self):
-        """return a dict of outputs, result values and artifact uris"""
-        outputs = {}
+        """
+        Return a dictionary of outputs, including result values and artifact URIs.
+
+        This method waits for the outputs to complete and combines result values
+        and artifact URIs into a single dictionary. If there are multiple artifacts
+        for the same key, only include the artifact that does not have the "latest" tag.
+        If there is no other tag, include the "latest" tag as a fallback.
+
+        :return: Dictionary containing result values and artifact URIs.
+        """
         self._outputs_wait_for_completion()
+        outputs = {}
+
+        # Add results if available
         if self.status.results:
-            outputs = {k: v for k, v in self.status.results.items()}
+            outputs.update(self.status.results)
+
+        # Artifacts are usually cached in the run object under `status.artifacts`. However, the artifacts are not
+        # stored in the DB as part of the run. The server may enrich the run with the artifacts or provide
+        # `status.artifact_uris` instead. See mlrun.common.formatters.run.RunFormat.
+        # When running locally - `status.artifact_uri` does not exist in the run.
+        # When listing runs - `status.artifacts` does not exist in the run.
         if self.status.artifacts:
-            for a in self.status.artifacts:
-                key = a["key"] if is_legacy_artifact(a) else a["metadata"]["key"]
-                outputs[key] = get_artifact_target(a, self.metadata.project)
+            outputs.update(self._process_artifacts(self.status.artifacts))
+        elif self.status.artifact_uris:
+            outputs.update(self.status.artifact_uris)
+
         return outputs
 
-    def artifact(self, key) -> "mlrun.DataItem":
-        """return artifact DataItem by key"""
+    def artifact(self, key: str) -> typing.Optional["mlrun.DataItem"]:
+        """Return artifact DataItem by key.
+
+        This method waits for the outputs to complete, searches for the artifact matching the given key,
+        and returns a DataItem if the artifact is found.
+
+        :param key: The key of the artifact to find.
+        :return: A DataItem corresponding to the artifact with the given key, or None if no such artifact is found.
+        """
         self._outputs_wait_for_completion()
         artifact = self._artifact(key)
-        if artifact:
-            uri = get_artifact_target(artifact, self.metadata.project)
-            if uri:
-                return mlrun.get_dataitem(uri)
-        return None
+        if not artifact:
+            return None
+        uri = get_artifact_target(artifact, self.metadata.project)
+        return mlrun.get_dataitem(uri) if uri else None
 
     def _outputs_wait_for_completion(
         self,
@@ -1489,12 +1697,90 @@ class RunObject(RunTemplate):
             )
 
     def _artifact(self, key):
-        """return artifact DataItem by key"""
-        if self.status.artifacts:
-            for a in self.status.artifacts:
-                if a["metadata"]["key"] == key:
-                    return a
-        return None
+        """
+        Return the last artifact DataItem that matches the given key.
+
+        If multiple artifacts with the same key exist, return the last one in the list.
+        If there are artifacts with different tags, the method will return the one with a tag other than 'latest'
+        if available.
+        If no artifact with the given key is found, return None.
+
+        :param key: The key of the artifact to retrieve.
+        :return: The last artifact DataItem with the given key, or None if no such artifact is found.
+        """
+        if not self.status.artifacts and not self.status.artifact_uris:
+            return None
+
+        # Collect artifacts that match the key
+        matching_artifacts = [
+            artifact
+            for artifact in self.status.artifacts
+            if artifact["metadata"].get("key") == key
+        ]
+
+        if not matching_artifacts:
+            if key not in self.status.artifact_uris:
+                return None
+
+            # Get artifact by store URI sanity (should have been enriched by now in status.artifacts property)
+            artifact_uri = self.status.artifact_uris[key]
+            return mlrun.datastore.get_store_resource(artifact_uri)
+
+        # Sort matching artifacts by creation date in ascending order.
+        # The last element in the list will be the one created most recently.
+        # In case the `created` field does not exist in the artifact, that artifact will appear first in the sorted list
+        matching_artifacts.sort(
+            key=lambda artifact: artifact["metadata"].get("created", datetime.min)
+        )
+
+        # Filter out artifacts with 'latest' tag
+        non_latest_artifacts = [
+            artifact
+            for artifact in matching_artifacts
+            if artifact["metadata"].get("tag") != "latest"
+        ]
+
+        # Return the last non-'latest' artifact if available, otherwise return the last artifact
+        # In the case of only one tag, `status.artifacts` includes [v1, latest]. In that case, we want to return v1.
+        # In the case of multiple tags, `status.artifacts` includes [v1, latest, v2, v3].
+        # In that case, we need to return the last one (v3).
+        return (non_latest_artifacts or matching_artifacts)[-1]
+
+    def _process_artifacts(self, artifacts):
+        artifacts_by_key = {}
+
+        # Organize artifacts by key
+        for artifact in artifacts:
+            key = artifact["metadata"]["key"]
+            if key not in artifacts_by_key:
+                artifacts_by_key[key] = []
+            artifacts_by_key[key].append(artifact)
+
+        outputs = {}
+        for key, artifacts in artifacts_by_key.items():
+            # Sort matching artifacts by creation date in ascending order.
+            # The last element in the list will be the one created most recently.
+            # In case the `created` field does not exist in the artifactthat artifact will appear
+            # first in the sorted list
+            artifacts.sort(
+                key=lambda artifact: artifact["metadata"].get("created", datetime.min)
+            )
+
+            # Filter out artifacts with 'latest' tag
+            non_latest_artifacts = [
+                artifact
+                for artifact in artifacts
+                if artifact["metadata"].get("tag") != "latest"
+            ]
+
+            # Save the last non-'latest' artifact if available, otherwise save the last artifact
+            # In the case of only one tag, `artifacts` includes [v1, latest], in that case, we want to save v1.
+            # In the case of multiple tags, `artifacts` includes [v1, latest, v2, v3].
+            # In that case, we need to save the last one (v3).
+            artifact_to_save = (non_latest_artifacts or artifacts)[-1]
+            outputs[key] = get_artifact_target(artifact_to_save, self.metadata.project)
+
+        return outputs
 
     def uid(self):
         """run unique id"""
@@ -1502,7 +1788,10 @@ class RunObject(RunTemplate):
 
     def state(self):
         """current run state"""
-        if self.status.state in mlrun.runtimes.constants.RunStates.terminal_states():
+        if (
+            self.status.state
+            in mlrun.common.runtimes.constants.RunStates.terminal_states()
+        ):
             return self.status.state
         self.refresh()
         return self.status.state or "unknown"
@@ -1516,8 +1805,10 @@ class RunObject(RunTemplate):
             iter=self.metadata.iteration,
         )
         if run:
-            self.status = RunStatus.from_dict(run.get("status", {}))
-            self.status.from_dict(run.get("status", {}))
+            run_status = run.get("status", {})
+            # Artifacts are not stored in the DB, so we need to preserve them here
+            run_status["artifacts"] = self.status.artifacts
+            self.status = RunStatus.from_dict(run_status)
             return self
 
     def show(self):
@@ -1564,7 +1855,7 @@ class RunObject(RunTemplate):
         last_pull_log_time = None
         logs_enabled = show_logs is not False
         state = self.state()
-        if state not in mlrun.runtimes.constants.RunStates.terminal_states():
+        if state not in mlrun.common.runtimes.constants.RunStates.terminal_states():
             logger.info(
                 f"run {self.metadata.name} is not completed yet, waiting for it to complete",
                 current_state=state,
@@ -1574,7 +1865,8 @@ class RunObject(RunTemplate):
             if (
                 logs_enabled
                 and logs_interval
-                and state not in mlrun.runtimes.constants.RunStates.terminal_states()
+                and state
+                not in mlrun.common.runtimes.constants.RunStates.terminal_states()
                 and (
                     last_pull_log_time is None
                     or (datetime.now() - last_pull_log_time).seconds > logs_interval
@@ -1583,7 +1875,7 @@ class RunObject(RunTemplate):
                 last_pull_log_time = datetime.now()
                 state, offset = self.logs(watch=False, offset=offset)
 
-            if state in mlrun.runtimes.constants.RunStates.terminal_states():
+            if state in mlrun.common.runtimes.constants.RunStates.terminal_states():
                 if logs_enabled and logs_interval:
                     self.logs(watch=False, offset=offset)
                 break
@@ -1595,12 +1887,20 @@ class RunObject(RunTemplate):
                 )
         if logs_enabled and not logs_interval:
             self.logs(watch=False)
-        if raise_on_failure and state != mlrun.runtimes.constants.RunStates.completed:
+        if (
+            raise_on_failure
+            and state != mlrun.common.runtimes.constants.RunStates.completed
+        ):
             raise mlrun.errors.MLRunRuntimeError(
                 f"Task {self.metadata.name} did not complete (state={state})"
             )
 
         return state
+
+    def abort(self):
+        """abort the run"""
+        db = mlrun.get_run_db()
+        db.abort_run(self.metadata.uid, self.metadata.project)
 
     @staticmethod
     def create_uri(project: str, uid: str, iteration: Union[int, str], tag: str = ""):
@@ -1611,9 +1911,12 @@ class RunObject(RunTemplate):
 
     @staticmethod
     def parse_uri(uri: str) -> tuple[str, str, str, str]:
-        uri_pattern = (
-            r"^(?P<project>.*)@(?P<uid>.*)\#(?P<iteration>.*?)(:(?P<tag>.*))?$"
-        )
+        """Parse the run's uri
+
+        :param uri: run uri in the format of <project>@<uid>#<iteration>[:tag]
+        :return: project, uid, iteration, tag
+        """
+        uri_pattern = mlrun.utils.regex.run_uri_pattern
         match = re.match(uri_pattern, uri)
         if not match:
             raise ValueError(
@@ -1636,7 +1939,7 @@ class EntrypointParam(ModelObj):
         default=None,
         doc="",
         required=None,
-        choices: list = None,
+        choices: Optional[list] = None,
     ):
         self.name = name
         self.type = type
@@ -1827,14 +2130,16 @@ class DataSource(ModelObj):
     ]
     kind = None
 
+    _fields_to_serialize = ["start_time", "end_time"]
+
     def __init__(
         self,
-        name: str = None,
-        path: str = None,
-        attributes: dict[str, object] = None,
-        key_field: str = None,
-        time_field: str = None,
-        schedule: str = None,
+        name: Optional[str] = None,
+        path: Optional[str] = None,
+        attributes: Optional[dict[str, object]] = None,
+        key_field: Optional[str] = None,
+        time_field: Optional[str] = None,
+        schedule: Optional[str] = None,
         start_time: Optional[Union[datetime, str]] = None,
         end_time: Optional[Union[datetime, str]] = None,
     ):
@@ -1854,6 +2159,16 @@ class DataSource(ModelObj):
 
     def set_secrets(self, secrets):
         self._secrets = secrets
+
+    def _serialize_field(
+        self, struct: dict, field_name: Optional[str] = None, strip: bool = False
+    ) -> typing.Any:
+        value = super()._serialize_field(struct, field_name, strip)
+        # We pull the field from self and not from struct because it was excluded from the struct when looping over
+        # the fields to save.
+        if field_name in ("start_time", "end_time") and isinstance(value, datetime):
+            return value.isoformat()
+        return value
 
 
 class DataTargetBase(ModelObj):
@@ -1878,7 +2193,9 @@ class DataTargetBase(ModelObj):
     ]
 
     @classmethod
-    def from_dict(cls, struct=None, fields=None, deprecated_fields: dict = None):
+    def from_dict(
+        cls, struct=None, fields=None, deprecated_fields: Optional[dict] = None
+    ):
         return super().from_dict(struct, fields=fields)
 
     def get_path(self):
@@ -1894,10 +2211,10 @@ class DataTargetBase(ModelObj):
 
     def __init__(
         self,
-        kind: str = None,
+        kind: Optional[str] = None,
         name: str = "",
         path=None,
-        attributes: dict[str, str] = None,
+        attributes: Optional[dict[str, str]] = None,
         after_step=None,
         partitioned: bool = False,
         key_bucketing_number: Optional[int] = None,
@@ -1905,8 +2222,8 @@ class DataTargetBase(ModelObj):
         time_partitioning_granularity: Optional[str] = None,
         max_events: Optional[int] = None,
         flush_after_seconds: Optional[int] = None,
-        storage_options: dict[str, str] = None,
-        schema: dict[str, Any] = None,
+        storage_options: Optional[dict[str, str]] = None,
+        schema: Optional[dict[str, Any]] = None,
         credentials_prefix=None,
     ):
         self.name = name
@@ -1945,6 +2262,7 @@ class DataTarget(DataTargetBase):
         "name",
         "kind",
         "path",
+        "attributes",
         "start_time",
         "online",
         "status",
@@ -1961,7 +2279,7 @@ class DataTarget(DataTargetBase):
 
     def __init__(
         self,
-        kind: str = None,
+        kind: Optional[str] = None,
         name: str = "",
         path=None,
         online=None,
@@ -1976,6 +2294,7 @@ class DataTarget(DataTargetBase):
         self.last_written = None
         self._producer = None
         self.producer = {}
+        self.attributes = {}
 
     @property
     def producer(self) -> FeatureSetProducer:
@@ -1989,12 +2308,12 @@ class DataTarget(DataTargetBase):
 class VersionedObjMetadata(ModelObj):
     def __init__(
         self,
-        name: str = None,
-        tag: str = None,
-        uid: str = None,
-        project: str = None,
-        labels: dict[str, str] = None,
-        annotations: dict[str, str] = None,
+        name: Optional[str] = None,
+        tag: Optional[str] = None,
+        uid: Optional[str] = None,
+        project: Optional[str] = None,
+        labels: Optional[dict[str, str]] = None,
+        annotations: Optional[dict[str, str]] = None,
         updated=None,
     ):
         self.name = name

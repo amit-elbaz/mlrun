@@ -17,12 +17,13 @@ import kubernetes.client
 
 import mlrun.common.schemas.function
 import mlrun.errors
+import mlrun.k8s_utils
 import mlrun.runtimes.pod
 from mlrun.config import config
+from mlrun.runtimes.mounts import mount_v3io, mount_v3iod
 
 from ...execution import MLClientCtx
 from ...model import RunObject
-from ...platforms.iguazio import mount_v3io, mount_v3iod
 from ...utils import update_in, verify_field_regex
 from ..kubejob import KubejobRuntime
 from ..pod import KubeResourceSpec
@@ -404,8 +405,8 @@ class Spark3JobSpec(KubeResourceSpec):
     def _verify_and_set_requests(
         self,
         resources_field_name,
-        mem: str = None,
-        cpu: str = None,
+        mem: typing.Optional[str] = None,
+        cpu: typing.Optional[str] = None,
         patch: bool = False,
     ):
         # Spark operator uses JVM notation for memory, so we must verify it separately
@@ -451,7 +452,7 @@ class Spark3JobSpec(KubeResourceSpec):
 class Spark3Runtime(KubejobRuntime):
     group = "sparkoperator.k8s.io"
     version = "v1beta2"
-    apiVersion = group + "/" + version
+    apiVersion = group + "/" + version  # noqa: N815
     kind = "spark"
     plural = "sparkapplications"
 
@@ -505,13 +506,11 @@ class Spark3Runtime(KubejobRuntime):
             raise NotImplementedError(
                 "Setting node name is not supported for spark runtime"
             )
-        # TODO add affinity support
-        # https://github.com/GoogleCloudPlatform/spark-on-k8s-operator/blob/master/pkg/apis/sparkoperator.k8s.io/v1beta2/types.go#L491
-        if affinity:
-            raise NotImplementedError(
-                "Setting affinity is not supported for spark runtime"
-            )
-        super().with_node_selection(node_name, node_selector, affinity, tolerations)
+        mlrun.k8s_utils.validate_node_selectors(node_selector, raise_on_error=False)
+        self.with_driver_node_selection(node_name, node_selector, affinity, tolerations)
+        self.with_executor_node_selection(
+            node_name, node_selector, affinity, tolerations
+        )
 
     def with_driver_node_selection(
         self,
@@ -537,11 +536,12 @@ class Spark3Runtime(KubejobRuntime):
             raise NotImplementedError(
                 "Setting node name is not supported for spark runtime"
             )
-        if affinity:
+        if affinity is not None:
             self.spec.driver_affinity = affinity
-        if node_selector:
+        if node_selector is not None:
+            mlrun.k8s_utils.validate_node_selectors(node_selector, raise_on_error=False)
             self.spec.driver_node_selector = node_selector
-        if tolerations:
+        if tolerations is not None:
             self.spec.driver_tolerations = tolerations
 
     def with_executor_node_selection(
@@ -568,11 +568,12 @@ class Spark3Runtime(KubejobRuntime):
             raise NotImplementedError(
                 "Setting node name is not supported for spark runtime"
             )
-        if affinity:
+        if affinity is not None:
             self.spec.executor_affinity = affinity
-        if node_selector:
+        if node_selector is not None:
+            mlrun.k8s_utils.validate_node_selectors(node_selector, raise_on_error=False)
             self.spec.executor_node_selector = node_selector
-        if tolerations:
+        if tolerations is not None:
             self.spec.executor_tolerations = tolerations
 
     def with_preemption_mode(
@@ -773,7 +774,11 @@ class Spark3Runtime(KubejobRuntime):
                 exporter_jar="/spark/jars/jmx_prometheus_javaagent-0.16.1.jar",
             )
 
-    def with_cores(self, executor_cores: int = None, driver_cores: int = None):
+    def with_cores(
+        self,
+        executor_cores: typing.Optional[int] = None,
+        driver_cores: typing.Optional[int] = None,
+    ):
         """
         Allows to configure spark.executor.cores and spark.driver.cores parameters. The values must be integers
         greater than or equal to 1. If a parameter is not specified, it defaults to 1.
@@ -811,9 +816,7 @@ class Spark3Runtime(KubejobRuntime):
 
     @classmethod
     def deploy_default_image(cls, with_gpu=False):
-        from mlrun.run import new_function
-
-        sj = new_function(kind=cls.kind, name="spark-default-image-deploy-temp")
+        sj = mlrun.new_function(kind=cls.kind, name="spark-default-image-deploy-temp")
         sj.spec.build.image = cls._get_default_deployed_mlrun_image_name(with_gpu)
 
         # setting required resources
@@ -854,7 +857,7 @@ class Spark3Runtime(KubejobRuntime):
         skip_deployed=False,
         is_kfp=False,
         mlrun_version_specifier=None,
-        builder_env: dict = None,
+        builder_env: typing.Optional[dict] = None,
         show_on_failure: bool = False,
         force_build: bool = False,
     ):
@@ -945,7 +948,10 @@ class Spark3Runtime(KubejobRuntime):
         )
 
     def with_executor_requests(
-        self, mem: str = None, cpu: str = None, patch: bool = False
+        self,
+        mem: typing.Optional[str] = None,
+        cpu: typing.Optional[str] = None,
+        patch: bool = False,
     ):
         """
         set executor pod required cpu/memory/gpu resources
@@ -955,8 +961,8 @@ class Spark3Runtime(KubejobRuntime):
 
     def with_executor_limits(
         self,
-        cpu: str = None,
-        gpus: int = None,
+        cpu: typing.Optional[str] = None,
+        gpus: typing.Optional[int] = None,
         gpu_type: str = "nvidia.com/gpu",
         patch: bool = False,
     ):
@@ -971,7 +977,10 @@ class Spark3Runtime(KubejobRuntime):
         )
 
     def with_driver_requests(
-        self, mem: str = None, cpu: str = None, patch: bool = False
+        self,
+        mem: typing.Optional[str] = None,
+        cpu: typing.Optional[str] = None,
+        patch: bool = False,
     ):
         """
         set driver pod required cpu/memory/gpu resources
@@ -981,8 +990,8 @@ class Spark3Runtime(KubejobRuntime):
 
     def with_driver_limits(
         self,
-        cpu: str = None,
-        gpus: int = None,
+        cpu: typing.Optional[str] = None,
+        gpus: typing.Optional[int] = None,
         gpu_type: str = "nvidia.com/gpu",
         patch: bool = False,
     ):

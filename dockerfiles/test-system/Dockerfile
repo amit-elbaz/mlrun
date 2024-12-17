@@ -15,7 +15,7 @@ ARG MLRUN_PYTHON_VERSION=3.9
 
 FROM gcr.io/iguazio/python:${MLRUN_PYTHON_VERSION}-slim
 
-ENV PIP_NO_CACHE_DIR=1
+ENV PIP_NO_CACHE_DIR 1
 
 RUN apt-get update && apt-get install --no-install-recommends -y \
   gcc \
@@ -24,7 +24,7 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
   make \
  && rm -rf /var/lib/apt/lists/*
 
-ARG MLRUN_PIP_VERSION=23.2.1
+ARG MLRUN_PIP_VERSION=24.2
 RUN python -m pip install --upgrade pip~=${MLRUN_PIP_VERSION}
 
 COPY ./dockerfiles/mlrun-api/requirements.txt /tmp/mlrun-requirements/mlrun-api-requirements.txt

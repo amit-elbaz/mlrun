@@ -14,11 +14,18 @@
 #
 import typing
 
-import pydantic
+import pydantic.v1
+from deprecated import deprecated
 
 import mlrun.common.types
 
 
+@deprecated(
+    version="1.7.0",
+    reason="mlrun.common.schemas.PipelinesFormat is deprecated and will be removed in 1.9.0. "
+    "Use mlrun.common.formatters.PipelineFormat instead.",
+    category=FutureWarning,
+)
 class PipelinesFormat(mlrun.common.types.StrEnum):
     full = "full"
     metadata_only = "metadata_only"
@@ -32,7 +39,7 @@ class PipelinesPagination(str):
     max_page_size = 200
 
 
-class PipelinesOutput(pydantic.BaseModel):
+class PipelinesOutput(pydantic.v1.BaseModel):
     # use the format query param to control what is returned
     runs: list[typing.Union[dict, str]]
     total_size: int

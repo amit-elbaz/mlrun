@@ -14,6 +14,7 @@
 
 import time
 from datetime import datetime
+from typing import Optional
 
 import fsspec
 import v3io
@@ -29,11 +30,13 @@ from .base import (
 )
 
 V3IO_LOCAL_ROOT = "v3io"
-V3IO_DEFAULT_UPLOAD_CHUNK_SIZE = 1024 * 1024 * 100
+V3IO_DEFAULT_UPLOAD_CHUNK_SIZE = 1024 * 1024 * 10
 
 
 class V3ioStore(DataStore):
-    def __init__(self, parent, schema, name, endpoint="", secrets: dict = None):
+    def __init__(
+        self, parent, schema, name, endpoint="", secrets: Optional[dict] = None
+    ):
         super().__init__(parent, name, schema, endpoint, secrets=secrets)
         self.endpoint = self.endpoint or mlrun.mlconf.v3io_api
 
@@ -140,6 +143,7 @@ class V3ioStore(DataStore):
         max_chunk_size: int = V3IO_DEFAULT_UPLOAD_CHUNK_SIZE,
     ):
         """helper function for put method, allows for controlling max_chunk_size in testing"""
+        data, _ = self._prepare_put_data(data, append)
         container, path = split_path(self._join(key))
         buffer_size = len(data)  # in bytes
         buffer_offset = 0

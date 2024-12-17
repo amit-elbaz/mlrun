@@ -15,12 +15,10 @@
 import json
 import os
 import urllib
-from collections import namedtuple
+from typing import Optional
 from urllib.parse import urlparse
 
-import kfp.dsl
 import requests
-import semver
 import v3io
 
 import mlrun.errors
@@ -28,203 +26,6 @@ from mlrun.config import config as mlconf
 from mlrun.utils import dict_to_json
 
 _cached_control_session = None
-
-VolumeMount = namedtuple("Mount", ["path", "sub_path"])
-
-
-def mount_v3io(
-    name="v3io",
-    remote="",
-    access_key="",
-    user="",
-    secret=None,
-    volume_mounts=None,
-):
-    """Modifier function to apply to a Container Op to volume mount a v3io path
-
-    :param name:            the volume name
-    :param remote:          the v3io path to use for the volume. ~/ prefix will be replaced with /users/<username>/
-    :param access_key:      the access key used to auth against v3io. if not given V3IO_ACCESS_KEY env var will be used
-    :param user:            the username used to auth against v3io. if not given V3IO_USERNAME env var will be used
-    :param secret:          k8s secret name which would be used to get the username and access key to auth against v3io.
-    :param volume_mounts:   list of VolumeMount. empty volume mounts & remote will default to mount /v3io & /User.
-    """
-    volume_mounts, user = _enrich_and_validate_v3io_mounts(
-        remote=remote,
-        volume_mounts=volume_mounts,
-        user=user,
-    )
-
-    def _attach_volume_mounts_and_creds(container_op: kfp.dsl.ContainerOp):
-        from kubernetes import client as k8s_client
-
-        vol = v3io_to_vol(name, remote, access_key, user, secret=secret)
-        container_op.add_volume(vol)
-        for volume_mount in volume_mounts:
-            container_op.container.add_volume_mount(
-                k8s_client.V1VolumeMount(
-                    mount_path=volume_mount.path,
-                    sub_path=volume_mount.sub_path,
-                    name=name,
-                )
-            )
-
-        if not secret:
-            container_op = v3io_cred(access_key=access_key, user=user)(container_op)
-        return container_op
-
-    return _attach_volume_mounts_and_creds
-
-
-def _enrich_and_validate_v3io_mounts(remote="", volume_mounts=None, user=""):
-    if remote and not volume_mounts:
-        raise mlrun.errors.MLRunInvalidArgumentError(
-            "volume_mounts must be specified when remote is given"
-        )
-
-    # Empty remote & volume_mounts defaults are volume mounts of /v3io and /User
-    if not remote and not volume_mounts:
-        user = _resolve_mount_user(user)
-        if not user:
-            raise mlrun.errors.MLRunInvalidArgumentError(
-                "user name/env must be specified when using empty remote and volume_mounts"
-            )
-        volume_mounts = [
-            VolumeMount(path="/v3io", sub_path=""),
-            VolumeMount(path="/User", sub_path="users/" + user),
-        ]
-
-    if not isinstance(volume_mounts, list) and any(
-        [not isinstance(x, VolumeMount) for x in volume_mounts]
-    ):
-        raise TypeError("mounts should be a list of Mount")
-
-    return volume_mounts, user
-
-
-def _resolve_mount_user(user=None):
-    return user or os.environ.get("V3IO_USERNAME")
-
-
-def mount_spark_conf():
-    def _mount_spark(container_op: kfp.dsl.ContainerOp):
-        from kubernetes import client as k8s_client
-
-        container_op.container.add_volume_mount(
-            k8s_client.V1VolumeMount(
-                name="spark-master-config", mount_path="/etc/config/spark"
-            )
-        )
-        return container_op
-
-    return _mount_spark
-
-
-def mount_v3iod(namespace, v3io_config_configmap):
-    def _mount_v3iod(container_op: kfp.dsl.ContainerOp):
-        from kubernetes import client as k8s_client
-
-        def add_vol(name, mount_path, host_path):
-            vol = k8s_client.V1Volume(
-                name=name,
-                host_path=k8s_client.V1HostPathVolumeSource(path=host_path, type=""),
-            )
-            container_op.add_volume(vol)
-            container_op.container.add_volume_mount(
-                k8s_client.V1VolumeMount(mount_path=mount_path, name=name)
-            )
-
-        # this is a legacy path for the daemon shared memory
-        host_path = "/dev/shm/"
-
-        # path to shared memory for daemon was changed in Iguazio 3.2.3-b1
-        igz_version = mlrun.mlconf.get_parsed_igz_version()
-        if igz_version and igz_version >= semver.VersionInfo.parse("3.2.3-b1"):
-            host_path = "/var/run/iguazio/dayman-shm/"
-        add_vol(name="shm", mount_path="/dev/shm", host_path=host_path + namespace)
-
-        add_vol(
-            name="v3iod-comm",
-            mount_path="/var/run/iguazio/dayman",
-            host_path="/var/run/iguazio/dayman/" + namespace,
-        )
-
-        vol = k8s_client.V1Volume(
-            name="daemon-health", empty_dir=k8s_client.V1EmptyDirVolumeSource()
-        )
-        container_op.add_volume(vol)
-        container_op.container.add_volume_mount(
-            k8s_client.V1VolumeMount(
-                mount_path="/var/run/iguazio/daemon_health", name="daemon-health"
-            )
-        )
-
-        vol = k8s_client.V1Volume(
-            name="v3io-config",
-            config_map=k8s_client.V1ConfigMapVolumeSource(
-                name=v3io_config_configmap, default_mode=420
-            ),
-        )
-        container_op.add_volume(vol)
-        container_op.container.add_volume_mount(
-            k8s_client.V1VolumeMount(mount_path="/etc/config/v3io", name="v3io-config")
-        )
-
-        container_op.container.add_env_variable(
-            k8s_client.V1EnvVar(
-                name="CURRENT_NODE_IP",
-                value_from=k8s_client.V1EnvVarSource(
-                    field_ref=k8s_client.V1ObjectFieldSelector(
-                        api_version="v1", field_path="status.hostIP"
-                    )
-                ),
-            )
-        )
-        container_op.container.add_env_variable(
-            k8s_client.V1EnvVar(
-                name="IGZ_DATA_CONFIG_FILE", value="/igz/java/conf/v3io.conf"
-            )
-        )
-
-        return container_op
-
-    return _mount_v3iod
-
-
-def v3io_cred(api="", user="", access_key=""):
-    """
-    Modifier function to copy local v3io env vars to container
-
-    Usage::
-
-        train = train_op(...)
-        train.apply(use_v3io_cred())
-    """
-
-    def _use_v3io_cred(container_op: kfp.dsl.ContainerOp):
-        from os import environ
-
-        from kubernetes import client as k8s_client
-
-        web_api = api or environ.get("V3IO_API") or mlconf.v3io_api
-        _user = user or environ.get("V3IO_USERNAME")
-        _access_key = access_key or environ.get("V3IO_ACCESS_KEY")
-        v3io_framesd = mlconf.v3io_framesd or environ.get("V3IO_FRAMESD")
-
-        return (
-            container_op.container.add_env_variable(
-                k8s_client.V1EnvVar(name="V3IO_API", value=web_api)
-            )
-            .add_env_variable(k8s_client.V1EnvVar(name="V3IO_USERNAME", value=_user))
-            .add_env_variable(
-                k8s_client.V1EnvVar(name="V3IO_ACCESS_KEY", value=_access_key)
-            )
-            .add_env_variable(
-                k8s_client.V1EnvVar(name="V3IO_FRAMESD", value=v3io_framesd)
-            )
-        )
-
-    return _use_v3io_cred
 
 
 def split_path(mntpath=""):
@@ -297,34 +98,43 @@ class OutputStream:
 
         self._v3io_client = v3io.dataplane.Client(**v3io_client_kwargs)
         self._container, self._stream_path = split_path(stream_path)
+        self._shards = shards
+        self._retention_in_hours = retention_in_hours
+        self._create = create
+        self._endpoint = endpoint
         self._mock = mock
         self._mock_queue = []
 
-        if create and not mock:
-            # this import creates an import loop via the utils module, so putting it in execution path
-            from mlrun.utils.helpers import logger
+    def create_stream(self):
+        # this import creates an import loop via the utils module, so putting it in execution path
+        from mlrun.utils.helpers import logger
 
-            logger.debug(
-                "Creating output stream",
-                endpoint=endpoint,
-                container=self._container,
-                stream_path=self._stream_path,
-                shards=shards,
-                retention_in_hours=retention_in_hours,
-            )
-            response = self._v3io_client.stream.create(
-                container=self._container,
-                stream_path=self._stream_path,
-                shard_count=shards or 1,
-                retention_period_hours=retention_in_hours or 24,
-                raise_for_status=v3io.dataplane.RaiseForStatus.never,
-            )
-            if not (
-                response.status_code == 400 and "ResourceInUse" in str(response.body)
-            ):
-                response.raise_for_status([409, 204])
+        logger.debug(
+            "Creating output stream",
+            endpoint=self._endpoint,
+            container=self._container,
+            stream_path=self._stream_path,
+            shards=self._shards,
+            retention_in_hours=self._retention_in_hours,
+        )
+        response = self._v3io_client.stream.create(
+            container=self._container,
+            stream_path=self._stream_path,
+            shard_count=self._shards or 1,
+            retention_period_hours=self._retention_in_hours or 24,
+            raise_for_status=v3io.dataplane.RaiseForStatus.never,
+        )
+        if not (response.status_code == 400 and "ResourceInUse" in str(response.body)):
+            response.raise_for_status([409, 204])
 
-    def push(self, data):
+    def _lazy_init(self):
+        if self._create and not self._mock:
+            self._create = False
+            self.create_stream()
+
+    def push(self, data, partition_key=None):
+        self._lazy_init()
+
         def dump_record(rec):
             if not isinstance(rec, (str, bytes)):
                 return dict_to_json(rec)
@@ -332,7 +142,14 @@ class OutputStream:
 
         if not isinstance(data, list):
             data = [data]
-        records = [{"data": dump_record(rec)} for rec in data]
+
+        records = []
+        for rec in data:
+            record = {"data": dump_record(rec)}
+            if partition_key is not None:
+                record["partition_key"] = partition_key
+            records.append(record)
+
         if self._mock:
             # for mock testing
             self._mock_queue.extend(records)
@@ -405,7 +222,7 @@ class KafkaOutputStream:
 
         self._initialized = True
 
-    def push(self, data):
+    def push(self, data, partition_key=None):
         self._lazy_init()
 
         def dump_record(rec):
@@ -426,11 +243,17 @@ class KafkaOutputStream:
         else:
             for record in data:
                 serialized_record = dump_record(record)
-                self._kafka_producer.send(self._topic, serialized_record)
+                if isinstance(partition_key, str):
+                    partition_key = partition_key.encode("UTF-8")
+                self._kafka_producer.send(
+                    self._topic, serialized_record, key=partition_key
+                )
 
 
 class V3ioStreamClient:
-    def __init__(self, url: str, shard_id: int = 0, seek_to: str = None, **kwargs):
+    def __init__(
+        self, url: str, shard_id: int = 0, seek_to: Optional[str] = None, **kwargs
+    ):
         endpoint, stream_path = parse_path(url)
         seek_options = ["EARLIEST", "LATEST", "TIME", "SEQUENCE"]
         seek_to = seek_to or "LATEST"
@@ -525,8 +348,8 @@ def add_or_refresh_credentials(
     # different access keys for the 2 usages
     token = (
         token
-        # can't use mlrun.runtimes.constants.FunctionEnvironmentVariables.auth_session cause this is running in the
-        # import execution path (when we're initializing the run db) and therefore we can't import mlrun.runtimes
+        # can't use mlrun.common.runtimes.constants.FunctionEnvironmentVariables.auth_session cause this is running
+        # in the import execution path (when we're initializing the run db) and therefore we can't import mlrun.runtimes
         or os.environ.get("MLRUN_AUTH_SESSION")
         or os.environ.get("V3IO_ACCESS_KEY")
     )
@@ -582,3 +405,22 @@ def sanitize_username(username: str):
     So simply replace it with dash
     """
     return username.replace("_", "-")
+
+
+def min_iguazio_versions(*versions):
+    def decorator(function):
+        def wrapper(*args, **kwargs):
+            if mlrun.utils.helpers.validate_component_version_compatibility(
+                "iguazio", *versions
+            ):
+                return function(*args, **kwargs)
+
+            message = (
+                f"{function.__name__} is supported since Iguazio {' or '.join(versions)}, currently using "
+                f"Iguazio {mlconf.igz_version}."
+            )
+            raise mlrun.errors.MLRunIncompatibleVersionError(message)
+
+        return wrapper
+
+    return decorator

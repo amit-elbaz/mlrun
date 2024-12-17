@@ -19,7 +19,7 @@ import typing
 import warnings
 from urllib.parse import ParseResult, urlparse, urlunparse
 
-import pydantic
+import pydantic.v1
 from mergedeep import merge
 
 import mlrun
@@ -28,15 +28,16 @@ import mlrun.errors
 from ..secrets import get_secret_or_env
 
 
-class DatastoreProfile(pydantic.BaseModel):
+class DatastoreProfile(pydantic.v1.BaseModel):
     type: str
     name: str
     _private_attributes: list = ()
 
     class Config:
-        extra = pydantic.Extra.forbid
+        extra = pydantic.v1.Extra.forbid
 
-    @pydantic.validator("name")
+    @pydantic.v1.validator("name")
+    @classmethod
     def lower_case(cls, v):
         return v.lower()
 
@@ -74,14 +75,72 @@ class TemporaryClientDatastoreProfiles(metaclass=mlrun.utils.singleton.Singleton
 
 
 class DatastoreProfileBasic(DatastoreProfile):
-    type: str = pydantic.Field("basic")
+    type: str = pydantic.v1.Field("basic")
     _private_attributes = "private"
     public: str
     private: typing.Optional[str] = None
 
 
+class ConfigProfile(DatastoreProfile):
+    """
+    A profile class for managing configuration data with nested public and private attributes.
+    This class extends DatastoreProfile to handle configuration settings, separating them into
+    public and private dictionaries. Both dictionaries support nested structures, and the class
+    provides functionality to merge these attributes when needed.
+
+    Args:
+        public (Optional[dict]): Dictionary containing public configuration settings,
+            supporting nested structures
+        private (Optional[dict]): Dictionary containing private/sensitive configuration settings,
+            supporting nested structures
+
+    Example:
+        >>> public = {
+            "database": {
+                "host": "localhost",
+                "port": 5432
+            },
+            "api_version": "v1"
+        }
+        >>> private = {
+            "database": {
+                "password": "secret123",
+                "username": "admin"
+            },
+            "api_key": "xyz789"
+        }
+        >>> config = ConfigProfile("myconfig", public=public, private=private)
+
+        # When attributes() is called, it merges public and private:
+        # {
+        #     "database": {
+        #         "host": "localhost",
+        #         "port": 5432,
+        #         "password": "secret123",
+        #         "username": "admin"
+        #     },
+        #     "api_version": "v1",
+        #     "api_key": "xyz789"
+        # }
+
+    """
+
+    type = "config"
+    _private_attributes = "private"
+    public: typing.Optional[dict] = None
+    private: typing.Optional[dict] = None
+
+    def attributes(self):
+        res = {}
+        if self.public:
+            res = merge(res, self.public)
+        if self.private:
+            res = merge(res, self.private)
+        return res
+
+
 class DatastoreProfileKafkaTarget(DatastoreProfile):
-    type: str = pydantic.Field("kafka_target")
+    type: str = pydantic.v1.Field("kafka_target")
     _private_attributes = "kwargs_private"
     bootstrap_servers: typing.Optional[str] = None
     brokers: typing.Optional[str] = None
@@ -122,7 +181,7 @@ class DatastoreProfileKafkaTarget(DatastoreProfile):
 
 
 class DatastoreProfileKafkaSource(DatastoreProfile):
-    type: str = pydantic.Field("kafka_source")
+    type: str = pydantic.v1.Field("kafka_source")
     _private_attributes = ("kwargs_private", "sasl_user", "sasl_pass")
     brokers: typing.Union[str, list[str]]
     topics: typing.Union[str, list[str]]
@@ -161,7 +220,7 @@ class DatastoreProfileKafkaSource(DatastoreProfile):
 
 
 class DatastoreProfileV3io(DatastoreProfile):
-    type: str = pydantic.Field("v3io")
+    type: str = pydantic.v1.Field("v3io")
     v3io_access_key: typing.Optional[str] = None
     _private_attributes = "v3io_access_key"
 
@@ -177,7 +236,7 @@ class DatastoreProfileV3io(DatastoreProfile):
 
 
 class DatastoreProfileS3(DatastoreProfile):
-    type: str = pydantic.Field("s3")
+    type: str = pydantic.v1.Field("s3")
     _private_attributes = ("access_key_id", "secret_key")
     endpoint_url: typing.Optional[str] = None
     force_non_anonymous: typing.Optional[str] = None
@@ -185,6 +244,18 @@ class DatastoreProfileS3(DatastoreProfile):
     assume_role_arn: typing.Optional[str] = None
     access_key_id: typing.Optional[str] = None
     secret_key: typing.Optional[str] = None
+    bucket: typing.Optional[str] = None
+
+    @pydantic.v1.validator("bucket")
+    @classmethod
+    def check_bucket(cls, v):
+        if not v:
+            warnings.warn(
+                "The 'bucket' attribute will be mandatory starting from version 1.9",
+                FutureWarning,
+                stacklevel=2,
+            )
+        return v
 
     def secrets(self) -> dict:
         res = {}
@@ -203,11 +274,17 @@ class DatastoreProfileS3(DatastoreProfile):
         return res
 
     def url(self, subpath):
-        return f"s3:/{subpath}"
+        # TODO: There is an inconsistency with DatastoreProfileGCS. In DatastoreProfileGCS,
+        # we assume that the subpath can begin without a '/' character,
+        # while here we assume it always starts with one.
+        if self.bucket:
+            return f"s3://{self.bucket}{subpath}"
+        else:
+            return f"s3:/{subpath}"
 
 
 class DatastoreProfileRedis(DatastoreProfile):
-    type: str = pydantic.Field("redis")
+    type: str = pydantic.v1.Field("redis")
     _private_attributes = ("username", "password")
     endpoint_url: str
     username: typing.Optional[str] = None
@@ -250,7 +327,7 @@ class DatastoreProfileRedis(DatastoreProfile):
 
 
 class DatastoreProfileDBFS(DatastoreProfile):
-    type: str = pydantic.Field("dbfs")
+    type: str = pydantic.v1.Field("dbfs")
     _private_attributes = ("token",)
     endpoint_url: typing.Optional[str] = None  # host
     token: typing.Optional[str] = None
@@ -268,22 +345,40 @@ class DatastoreProfileDBFS(DatastoreProfile):
 
 
 class DatastoreProfileGCS(DatastoreProfile):
-    type: str = pydantic.Field("gcs")
+    type: str = pydantic.v1.Field("gcs")
     _private_attributes = ("gcp_credentials",)
     credentials_path: typing.Optional[str] = None  # path to file.
     gcp_credentials: typing.Optional[typing.Union[str, dict]] = None
+    bucket: typing.Optional[str] = None
 
-    @pydantic.validator("gcp_credentials", pre=True, always=True)
+    @pydantic.v1.validator("bucket")
+    @classmethod
+    def check_bucket(cls, v):
+        if not v:
+            warnings.warn(
+                "The 'bucket' attribute will be mandatory starting from version 1.9",
+                FutureWarning,
+                stacklevel=2,
+            )
+        return v
+
+    @pydantic.v1.validator("gcp_credentials", pre=True, always=True)
+    @classmethod
     def convert_dict_to_json(cls, v):
         if isinstance(v, dict):
             return json.dumps(v)
         return v
 
     def url(self, subpath) -> str:
+        # TODO: but there's something wrong with the subpath being assumed to not start with a slash here,
+        # but the opposite assumption is made in S3.
         if subpath.startswith("/"):
             #  in gcs the path after schema is starts with bucket, wherefore it should not start with "/".
             subpath = subpath[1:]
-        return f"gcs://{subpath}"
+        if self.bucket:
+            return f"gcs://{self.bucket}/{subpath}"
+        else:
+            return f"gcs://{subpath}"
 
     def secrets(self) -> dict:
         res = {}
@@ -295,7 +390,7 @@ class DatastoreProfileGCS(DatastoreProfile):
 
 
 class DatastoreProfileAzureBlob(DatastoreProfile):
-    type: str = pydantic.Field("az")
+    type: str = pydantic.v1.Field("az")
     _private_attributes = (
         "connection_string",
         "account_key",
@@ -311,12 +406,27 @@ class DatastoreProfileAzureBlob(DatastoreProfile):
     client_secret: typing.Optional[str] = None
     sas_token: typing.Optional[str] = None
     credential: typing.Optional[str] = None
+    container: typing.Optional[str] = None
+
+    @pydantic.v1.validator("container")
+    @classmethod
+    def check_container(cls, v):
+        if not v:
+            warnings.warn(
+                "The 'container' attribute will be mandatory starting from version 1.9",
+                FutureWarning,
+                stacklevel=2,
+            )
+        return v
 
     def url(self, subpath) -> str:
         if subpath.startswith("/"):
-            #  in azure the path after schema is starts with bucket, wherefore it should not start with "/".
+            #  in azure the path after schema is starts with container, wherefore it should not start with "/".
             subpath = subpath[1:]
-        return f"az://{subpath}"
+        if self.container:
+            return f"az://{self.container}/{subpath}"
+        else:
+            return f"az://{subpath}"
 
     def secrets(self) -> dict:
         res = {}
@@ -340,7 +450,7 @@ class DatastoreProfileAzureBlob(DatastoreProfile):
 
 
 class DatastoreProfileHdfs(DatastoreProfile):
-    type: str = pydantic.Field("hdfs")
+    type: str = pydantic.v1.Field("hdfs")
     _private_attributes = "token"
     host: typing.Optional[str] = None
     port: typing.Optional[int] = None
@@ -360,10 +470,10 @@ class DatastoreProfileHdfs(DatastoreProfile):
         return res or None
 
     def url(self, subpath):
-        return f"hdfs://{self.host}:{self.http_port}{subpath}"
+        return f"webhdfs://{self.host}:{self.http_port}{subpath}"
 
 
-class DatastoreProfile2Json(pydantic.BaseModel):
+class DatastoreProfile2Json(pydantic.v1.BaseModel):
     @staticmethod
     def _to_json(attributes):
         # First, base64 encode the values
@@ -424,6 +534,7 @@ class DatastoreProfile2Json(pydantic.BaseModel):
             "gcs": DatastoreProfileGCS,
             "az": DatastoreProfileAzureBlob,
             "hdfs": DatastoreProfileHdfs,
+            "config": ConfigProfile,
         }
         if datastore_type in ds_profile_factory:
             return ds_profile_factory[datastore_type].parse_obj(decoded_dict)
@@ -437,7 +548,7 @@ class DatastoreProfile2Json(pydantic.BaseModel):
             )
 
 
-def datastore_profile_read(url, project_name="", secrets: dict = None):
+def datastore_profile_read(url, project_name="", secrets: typing.Optional[dict] = None):
     parsed_url = urlparse(url)
     if parsed_url.scheme.lower() != "ds":
         raise mlrun.errors.MLRunInvalidArgumentError(

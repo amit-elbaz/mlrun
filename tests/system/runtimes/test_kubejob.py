@@ -40,6 +40,7 @@ def exec_cli(args, action="run"):
 class TestKubejobRuntime(tests.system.base.TestMLRunSystem):
     project_name = "kubejob-system-test"
 
+    @pytest.mark.smoke
     def test_deploy_function(self):
         code_path = str(self.assets_path / "kubejob_function.py")
 
@@ -67,7 +68,7 @@ class TestKubejobRuntime(tests.system.base.TestMLRunSystem):
             requirements_file=requirements_path,
         )
         function.deploy()
-        run = function.run(handler="mycls::do")
+        run = function.run(handler="MyCls::do")
         outputs = run.outputs
         assert "requests" in outputs, "requests not in outputs"
         assert "chardet" in outputs, "chardet not in outputs"
@@ -171,7 +172,9 @@ class TestKubejobRuntime(tests.system.base.TestMLRunSystem):
     def test_function_with_param(self):
         code_path = str(self.assets_path / "function_with_params.py")
 
-        proj = mlrun.get_or_create_project(self.project_name, self.results_path)
+        proj = mlrun.get_or_create_project(
+            self.project_name, self.results_path, allow_cross_project=True
+        )
         project_param = "some value"
         local_param = "my local param"
         proj.spec.params = {"project_param": project_param}
@@ -191,7 +194,9 @@ class TestKubejobRuntime(tests.system.base.TestMLRunSystem):
 
     def test_function_handler_with_args(self):
         code_path = str(self.assets_path / "function_with_args.py")
-        mlrun.get_or_create_project(self.project_name, self.results_path)
+        mlrun.get_or_create_project(
+            self.project_name, self.results_path, allow_cross_project=True
+        )
 
         function = mlrun.code_to_function(
             name="function-with-args",
@@ -222,7 +227,9 @@ class TestKubejobRuntime(tests.system.base.TestMLRunSystem):
 
     def test_function_with_args(self):
         code_path = str(self.assets_path / "function_with_args.py")
-        mlrun.get_or_create_project(self.project_name, self.results_path)
+        mlrun.get_or_create_project(
+            self.project_name, self.results_path, allow_cross_project=True
+        )
 
         function = mlrun.code_to_function(
             name="function-with-args",
@@ -249,7 +256,9 @@ class TestKubejobRuntime(tests.system.base.TestMLRunSystem):
         here we upload the python code file to v3io
         """
         code_path = str(self.assets_path / "function_with_args.py")
-        project = mlrun.get_or_create_project(self.project_name, self.results_path)
+        project = mlrun.get_or_create_project(
+            self.project_name, self.results_path, allow_cross_project=True
+        )
         art = project.log_artifact(
             "my_code_artifact", local_path=code_path, format="py"
         )
@@ -302,7 +311,9 @@ class TestKubejobRuntime(tests.system.base.TestMLRunSystem):
 
     def test_function_with_kwargs(self):
         code_path = str(self.assets_path / "function_with_kwargs.py")
-        mlrun.get_or_create_project(self.project_name, self.results_path)
+        mlrun.get_or_create_project(
+            self.project_name, self.results_path, allow_cross_project=True
+        )
 
         function = mlrun.code_to_function(
             name="function-with-kwargs",
@@ -316,6 +327,30 @@ class TestKubejobRuntime(tests.system.base.TestMLRunSystem):
         params.update(kwargs)
         run = function.run(params=params, handler="func")
         assert run.outputs["return"] == kwargs
+
+    # TODO: Un-skip
+    @pytest.mark.skip(
+        "Waiting for extra data parsing for default packager `pack` method"
+    )
+    def test_artifacts_with_future_links(self):
+        code_path = str(self.assets_path / "function_with_args.py")
+
+        function = mlrun.code_to_function(
+            name="function-with-args",
+            kind="job",
+            project=self.project_name,
+            filename=code_path,
+        )
+
+        p1 = 10
+        run = function.run(
+            handler="handler_with_future_links",
+            params={"p1": p1},
+            returns=["my_model", "px"],
+        )
+
+        # Get my_artifact and verify the extra data was enriched
+        assert run.outputs["my_model"]
 
     def test_class_handler(self):
         code_path = str(self.assets_path / "kubejob_function.py")
@@ -331,7 +366,7 @@ class TestKubejobRuntime(tests.system.base.TestMLRunSystem):
             image="mlrun/mlrun",
         )
         for params, results in cases:
-            run = function.run(handler="mycls::mtd", params=params)
+            run = function.run(handler="MyCls::mtd", params=params)
             print(run.to_yaml())
             assert run.status.results == results
 
@@ -461,7 +496,9 @@ def print_df(df):
 
     def test_function_handler_set_labels_and_annotations(self):
         code_path = str(self.assets_path / "handler.py")
-        mlrun.get_or_create_project(self.project_name, self.results_path)
+        mlrun.get_or_create_project(
+            self.project_name, self.results_path, allow_cross_project=True
+        )
 
         function = mlrun.code_to_function(
             name="test-func",
@@ -504,7 +541,9 @@ def print_df(df):
             f"--build-arg {extra_args_env_key}={extra_args_env_val} {extra_args_flag}"
         )
         code_path = str(self.assets_path / "function_with_env_vars.py")
-        project = mlrun.get_or_create_project(self.project_name, self.results_path)
+        project = mlrun.get_or_create_project(
+            self.project_name, self.results_path, allow_cross_project=True
+        )
 
         image_name = ".test-custom-image"
         project.build_image(
@@ -552,7 +591,9 @@ def print_df(df):
         )
 
         run = db.read_run(run.metadata.uid)
-        assert run["status"]["state"] == mlrun.runtimes.constants.RunStates.aborted
+        assert (
+            run["status"]["state"] == mlrun.common.runtimes.constants.RunStates.aborted
+        )
 
         # list background tasks
         background_tasks = db.list_project_background_tasks()

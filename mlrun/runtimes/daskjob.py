@@ -363,7 +363,7 @@ class DaskCluster(KubejobRuntime):
         skip_deployed=False,
         is_kfp=False,
         mlrun_version_specifier=None,
-        builder_env: dict = None,
+        builder_env: Optional[dict] = None,
         show_on_failure: bool = False,
         force_build: bool = False,
     ):
@@ -379,7 +379,7 @@ class DaskCluster(KubejobRuntime):
         :param show_on_failure:         show logs only in case of build failure
         :param force_build:             force building the image, even when no changes were made
 
-        :return True if the function is ready (deployed)
+        :return:                        True if the function is ready (deployed)
         """
         return super().deploy(
             watch,
@@ -406,9 +406,9 @@ class DaskCluster(KubejobRuntime):
 
     def with_scheduler_limits(
         self,
-        mem: str = None,
-        cpu: str = None,
-        gpus: int = None,
+        mem: Optional[str] = None,
+        cpu: Optional[str] = None,
+        gpus: Optional[int] = None,
         gpu_type: str = "nvidia.com/gpu",
         patch: bool = False,
     ):
@@ -422,9 +422,9 @@ class DaskCluster(KubejobRuntime):
 
     def with_worker_limits(
         self,
-        mem: str = None,
-        cpu: str = None,
-        gpus: int = None,
+        mem: Optional[str] = None,
+        cpu: Optional[str] = None,
+        gpus: Optional[int] = None,
         gpu_type: str = "nvidia.com/gpu",
         patch: bool = False,
     ):
@@ -442,7 +442,7 @@ class DaskCluster(KubejobRuntime):
         )
 
     def with_scheduler_requests(
-        self, mem: str = None, cpu: str = None, patch: bool = False
+        self, mem: Optional[str] = None, cpu: Optional[str] = None, patch: bool = False
     ):
         """
         set scheduler pod resources requests
@@ -451,7 +451,7 @@ class DaskCluster(KubejobRuntime):
         self.spec._verify_and_set_requests("scheduler_resources", mem, cpu, patch=patch)
 
     def with_worker_requests(
-        self, mem: str = None, cpu: str = None, patch: bool = False
+        self, mem: Optional[str] = None, cpu: Optional[str] = None, patch: bool = False
     ):
         """
         set worker pod resources requests
@@ -494,6 +494,7 @@ class DaskCluster(KubejobRuntime):
         notifications: Optional[list[mlrun.model.Notification]] = None,
         returns: Optional[list[Union[str, dict[str, str]]]] = None,
         state_thresholds: Optional[dict[str, int]] = None,
+        reset_on_run: Optional[bool] = None,
         **launcher_kwargs,
     ) -> RunObject:
         if state_thresholds:
@@ -547,7 +548,13 @@ class DaskCluster(KubejobRuntime):
                     "specified handler (string) without command "
                     "(py file path), specify command or use handler pointer"
                 )
-            handler = load_module(self.spec.command, handler, context=context)
+            # Do not embed the module in system as it is not persistent with the dask cluster
+            handler = load_module(
+                self.spec.command,
+                handler,
+                context=context,
+                embed_in_sys=False,
+            )
         client = self.client
         setattr(context, "dask_client", client)
         sout, serr = exec_from_params(handler, runobj, context)

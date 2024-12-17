@@ -7,11 +7,11 @@ This release of MLRun supports only Python 3.9 for both the server and the clien
 
 **In this section**
 - [Prerequisites](#prerequisites)
-- [Set up a Python 3.9 client environment](#set-up-a-python-3-9-client-environment)
+- [Set up a Python 3.9 client environment](#set-up-a-python-39-client-environment)
 - [Configure remote environment](#configure-remote-environment)
    - [Using `mlrun config set` command in MLRun CLI](#using-mlrun-config-set-command-in-mlrun-cli)
-   - [Using `mlrun.set_environment` command in MLRun SDK](#using-mlrun-set-environment-command-in-mlrun-sdk)
-   - [Using your IDE (e.g. PyCharm or VSCode)](#using-your-ide-e-g-pycharm-or-vscode)
+   - [Using `mlrun.set_environment` command in MLRun SDK](#using-mlrun-config-set-command-in-mlrun-cli)
+   - [Using your IDE (e.g. PyCharm or VSCode)](#using-your-ide-eg-pycharm-or-vscode)
 - [Setting up a dark site](#setting-up-a-dark-site)
 
 <a id="prerequisites"></a>
@@ -25,7 +25,7 @@ Applications:
 
 The MLRun server is based on a Python 3.9 environment. It's recommended to move the client to a Python 3.9 environment as well. 
 
-For a Python 3.7 environment for platform versions up to and including v3.5.2, see [Set up a Python 3.7 client environment](../change-log/index.html#set-up-a-python-3-7-client-environment-iguazio-versions-up-to-and-including-v3-5-2).
+For a Python 3.7 environment for platform versions up to and including v3.5.2, see [Set up a Python 3.7 client environment](../change-log/index.md#set-up-a-python-37-client-environment-iguazio-versions-up-to-and-including-v352).
 
 ## MLRun client supported OS
 The MLRun client supports:
@@ -33,7 +33,7 @@ The MLRun client supports:
 - Mac
 - Windows via WSL
 
-## Set up a Python 3.9 client environment 
+## Set up a Python 3.9 client environment
 
 1.  **Basic** <br> 
 Run ```pip install mlrun```
@@ -42,6 +42,14 @@ Run ```pip install mlrun```
 ```{admonition} Note
 To install a specific version, use the command: `pip install mlrun==<version>`. Replace the `<version>` placeholder with the MLRun version number.
 ```
+
+## Note for ARM64 (Apple Silicon) Users
+
+When using ARM64 (Apple Silicon), you need to use **conda** and install protobuf by running the following command:
+
+```bash
+conda install "protobuf>=3.20.3, <4" -y
+````
 
 2. **Advanced** <br> 
    - If you expect to connect to, or work with, cloud providers (Azure/Google Cloud/S3), you can install additional packages. This is not 
@@ -52,7 +60,7 @@ To install a specific version, use the command: `pip install mlrun==<version>`. 
      - ```pip install mlrun[google-cloud-storage]``` Install requirements for Google cloud storage
    
       
-   - To install all extras, run: ```pip install mlrun[complete]``` See the full list [here](https://github.com/mlrun/mlrun/blob/development/setup.py#L75).<br>
+   - To install all extras, run: ```pip install mlrun[complete]``` See the full list [here](https://github.com/mlrun/mlrun/blob/development/dependencies.py#L25).<br>
      
 3. Alternatively, if you already installed a previous version of MLRun, upgrade it by running:
 
@@ -79,8 +87,8 @@ To install a specific version, use the command: `pip install mlrun==<version>`. 
 ## Configure remote environment
 You have a few options to configure your remote environment:
 - [Using `mlrun config set` command in MLRun CLI](#using-mlrun-config-set-command-in-mlrun-cli)
-- [Using `mlrun.set_environment` command in MLRun SDK](#using-mlrun-set-environment-command-in-mlrun-sdk)
-- [Using your IDE (e.g PyCharm or VSCode)](#using-your-ide-e-g-pycharm-or-vscode)
+- [Using `mlrun.set_environment` command in MLRun SDK](#using-mlrunset_environment-command-in-mlrun-sdk)
+- [Using your IDE (e.g PyCharm or VSCode)](#using-your-ide-eg-pycharm-or-vscode)
 
 ### Using `mlrun config set` command in MLRun CLI
 
@@ -99,7 +107,7 @@ MLRUN_DBPATH=http://localhost:8080
 MLRUN_DBPATH saves the URL endpoint of the MLRun APIs service endpoint. Since it is localhost, username and access_key are not required (as in Example2) <br>
 
 **Example 2**<br>
-**Note:** Only relevant if your remote service is on an instance of the Iguazio MLOps Platform (**not MLRun CE**). <br>
+**Note:** Only relevant if your remote service is on an instance of the Iguazio AI Platform (**not MLRun CE**). <br>
 Run this command in MLRun CLI:
  ```
  mlrun config set -a https://mlrun-api.default-tenant.app.xxx.iguazio-cd1.com -u joe -k mykey -e 
@@ -170,7 +178,7 @@ V3IO_ACCESS_KEY=<platform access key>
 ```
 
 ```{admonition} Note
-If your remote service is on an instance of the Iguazio MLOps Platform, you can get all these parameters from the platform dashboard: select 
+If your remote service is on an instance of the Iguazio AI Platform, you can get all these parameters from the platform dashboard: select 
 the user-profile picture or icon from the top right corner of any page, and select  **Remote settings**. They are copied to the clipboard.
 ```
 
@@ -200,9 +208,9 @@ edit box and expand it to edit the environment variables.
     ![Environment variables](../_static/images/pycharm/remote-pycharm-environment_variables.png)
     
 
-   > If the remote service is on an instance of the Iguazio MLOps Platform, also set the environment variables and values of `V3IO_USERNAME`, and `V3IO_ACCESS_KEY`.
+   > If the remote service is on an instance of the Iguazio AI Platform, also set the environment variables and values of `V3IO_USERNAME`, and `V3IO_ACCESS_KEY`.
 
-#### Remote environment from VScode
+#### Remote environment from VSCode
 
 Create a [debug configuration in VSCode](https://code.visualstudio.com/docs/python/debugging). Configurations are defined in a `launch.json` 
 file that's stored in a `.vscode` folder in your workspace.

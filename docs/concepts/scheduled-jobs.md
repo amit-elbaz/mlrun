@@ -3,6 +3,10 @@
 
 Oftentimes you may want to run a `job` on a regular schedule. For example, fetching from a datasource every morning, compiling an analytics report every month, or detecting model drift every hour.
 
+> Schedules have a minimum interval that will be allowed between two scheduled jobs. By default, a job is not allowed to be scheduled twice in a 10-minute period 
+> Currently, schedules like */13 * * * * (every 13th minute), in which the job would trigger at the 52nd minute and then again at the start of the next hour (minute 0) (with only 8 minutes between runs) are not allowed. 
+> See mlrun.mlconf.httpdb.scheduling for service schedules configuration. 
+
 ## Creating a job and scheduling it
 
 MLRun makes it very simple to add a schedule to a given `job`. To showcase this, the following job runs the code below, which resides in a file titled `schedule.py`:
@@ -12,17 +16,18 @@ def hello(context):
     print("You just ran a scheduled job!")
 ```
 
-To create the job, use the `code_to_function` syntax and specify the `kind` like below:
+To create the job, use the `set_function` syntax and specify the `kind` like below:
 
 ```python
 import mlrun
 
-job = mlrun.code_to_function(
-    name="my-scheduled-job",      # Name of the job (displayed in console and UI)
-    filename="schedule.py",       # Python file or Jupyter notebook to run
-    kind="job",                   # Run as a job
-    image="mlrun/mlrun",          # Use this Docker image
-    handler="hello"               # Execute the function hello() within code.py
+project = mlrun.get_or_create_project("schedule")
+job = project.set_function(
+    name="my-scheduled-job",  # Name of the job (displayed in console and UI)
+    filename="schedule.py",  # Python file or Jupyter notebook to run
+    kind="job",  # Run as a job
+    image="mlrun/mlrun",  # Use this Docker image
+    handler="hello",  # Execute the function hello() within code.py
 )
 ```
 
@@ -50,11 +55,11 @@ project.run("main", schedule='0 * * * *')
 
 Remote/Scheduled workflows can be performed by a project with a remote source or one that is contained on the image. 
 Remote source will be pulled each time the workflow is run, while the local source will be loaded from the image.  
-To use a remote source you can either put your code in Git or archive it and then set a source to it (e.g. git://github.com/mlrun/something.git, http://some/url/file.zip, s3://some/url/file.tar.gz etc.). By default, the defined project source will be used.
+To use a remote source you can either put your code in Git or archive it and then set a source to it (e.g. `git://github.com/mlrun/something.git`, `http://some/url/file.zip`, `s3://some/url/file.tar.gz` etc.). By default, the defined project source will be used.
 * To set project source use the `project.set_source` method.
 * To set workflow use the `project.set_workflow` method.  
 
-To use a different remote source, specify the source URL whe running the workflow with `project.run(source=<source-URL>)` method.  
+To use a different remote source, specify the source URL when running the workflow with `project.run(source=<source-URL>)` method.  
 You can also use a context path to load the project from a local directory contained in the image used for execution:
 * To set project source use the `project.set_source` method (make sure `pull_at_runtime` is set to `False`).
 * To build the image with the project yaml and code use `project.build_image` method. Optionally specify a `target_dir` for the project content.
@@ -63,7 +68,16 @@ You can also use a context path to load the project from a local directory conta
 * Run the workflow with the context path e.g. `project.run("my-workflow", source="./", engine="remote")`. The `source` can be absolute or relative path with `"."` or `"./"`.
 
 Example for a remote GitHub project - https://github.com/mlrun/project-demo
+```{admonition} Note
+From MLRun v1.7.1: when running a remote/scheduled workflow, the remote workflow pulls/extracts the remote source content to the running pod but loads the project configuration from the MLRun DB and not from the project.yaml file in the remote source.
 
+The remote files are primarily retrieved for:
+- The [project_setup](../projects/project-setup.md) that may affect the project configuration (if it exists).
+- Syncing function files.
+This behavior may be unexpected for users who rely on project.yaml in the remote source (for the project configuration).
+Be sure to update MLRun DB with the latest project configuration to ensure consistent configuration management (use `project.save()`).<br>
+Project configuration in this context could be, for example, `project.node_selector` or `project.artifact_path`, and not function configurations like: function resources or function node selector.
+```
 ```
 import mlrun
 project_name = "remote-workflow-example"

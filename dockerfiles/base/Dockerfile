@@ -13,6 +13,9 @@
 # limitations under the License.
 #
 ARG MLRUN_PYTHON_VERSION=3.9
+ARG MLRUN_UV_IMAGE=ghcr.io/astral-sh/uv:latest
+
+FROM ${MLRUN_UV_IMAGE} AS uv-image
 
 FROM gcr.io/iguazio/python:${MLRUN_PYTHON_VERSION}-slim
 
@@ -21,18 +24,7 @@ RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get -y upgrade && \
     rm -rf /var/lib/apt/lists/*
 
-# Update base pip packages (usually pip, setuptools, wheel):
-RUN python -m pip  list --disable-pip-version-check --format freeze \
-    | grep -v '^\-e' \
-    | cut -d'=' -f1 \
-    | xargs python -m pip install --upgrade
-
-# need to be redeclared since used in the from
-ARG MLRUN_PYTHON_VERSION
-ENV PIP_NO_CACHE_DIR=1
-
 RUN apt update -qqq \
-    && apt -y upgrade \
     && apt install -y \
     build-essential \
     cmake \
@@ -50,7 +42,7 @@ RUN chmod 777 /mlrun
 
 # Install MiniConda (Python 3.9):
 ARG MLRUN_ANACONDA_PYTHON_DISTRIBUTION="-py39"
-RUN wget --quiet https://repo.anaconda.com/miniconda/Miniconda3${MLRUN_ANACONDA_PYTHON_DISTRIBUTION}_23.1.0-1-Linux-x86_64.sh -O ~/installconda.sh && \
+RUN wget --quiet https://repo.anaconda.com/miniconda/Miniconda3${MLRUN_ANACONDA_PYTHON_DISTRIBUTION}_23.11.0-1-Linux-x86_64.sh -O ~/installconda.sh && \
     /bin/bash ~/installconda.sh -b -p /opt/conda && \
     rm ~/installconda.sh && \
     /opt/conda/bin/conda update --all --use-local --yes && \
@@ -59,23 +51,31 @@ RUN wget --quiet https://repo.anaconda.com/miniconda/Miniconda3${MLRUN_ANACONDA_
     echo ". /opt/conda/etc/profile.d/conda.sh" >> ~/.bashrc && \
     echo "conda activate base" >> ~/.bashrc
 
-ENV PATH /opt/conda/bin:$PATH
+ENV PATH=/opt/conda/bin:$PATH
 
-ARG MLRUN_PIP_VERSION=23.2.1
-RUN conda config --add channels conda-forge && \
-    conda install python=${MLRUN_PYTHON_VERSION} pip~=${MLRUN_PIP_VERSION} && \
+RUN conda install -y -n base conda-libmamba-solver && \
+    conda config --set solver libmamba && \
     conda clean -aqy
 
-COPY ./dockerfiles/base/mlrun_requirements.txt ./mlrun-image-requirements.txt
-COPY ./extras-requirements.txt ./extras-requirements.txt
-COPY ./requirements.txt ./
-RUN python -m pip install \
-    -r requirements.txt \
-    -r extras-requirements.txt \
-    -r mlrun-image-requirements.txt
+# need to be redeclared since used in the from
+ARG MLRUN_PYTHON_VERSION=3.9
+ARG MLRUN_PIP_VERSION=24.2
+RUN conda config --add channels conda-forge && \
+    conda install -y python=${MLRUN_PYTHON_VERSION} pip~=${MLRUN_PIP_VERSION} && \
+    conda clean -aqy
 
-# if we give all the requirements together pip resolver go nuts so separating between the package and the image
-# requirements
-COPY ./dockerfiles/base/requirements.txt ./base-image-requirements.txt
-RUN python -m pip install \
-    -r base-image-requirements.txt
+ENV UV_SYSTEM_PYTHON=true UV_LINK_MODE=copy
+
+# do not require hashes as PyHive is installed via remote repo
+# and do not have a hash set in the locked-requirements.txt
+# therefor, verify the hashes but do not require them.
+RUN --mount=from=uv-image,source=/uv,target=/bin/uv \
+    --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=dockerfiles/base/locked-requirements.txt,target=locked-requirements.txt \
+    uv pip install --verify-hashes -r locked-requirements.txt
+
+COPY . .
+
+RUN --mount=from=uv-image,source=/uv,target=/bin/uv \
+    --mount=type=cache,target=/root/.cache/uv \
+    uv pip install .[complete]

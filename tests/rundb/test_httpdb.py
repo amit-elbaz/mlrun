@@ -16,6 +16,7 @@ import codecs
 import datetime
 import sys
 import time
+import typing
 from collections import namedtuple
 from os import environ
 from pathlib import Path
@@ -24,16 +25,22 @@ from socket import socket
 from subprocess import DEVNULL, PIPE, Popen, run
 from sys import executable
 from tempfile import mkdtemp
+from typing import Optional
 from uuid import uuid4
 
 import deepdiff
 import pytest
+import requests_mock as requests_mock_package
 
+import mlrun.alerts
+import mlrun.artifacts
 import mlrun.artifacts.base
+import mlrun.common.formatters
 import mlrun.common.schemas
 import mlrun.errors
 import mlrun.projects.project
 from mlrun import RunObject
+from mlrun.db.auth_utils import StaticTokenProvider
 from mlrun.db.httpdb import HTTPRunDB
 from tests.conftest import tests_root_directory, wait_for_server
 
@@ -63,6 +70,7 @@ def create_workdir(root_dir="/tmp"):
 def start_server(workdir, env_config: dict):
     port = free_port()
     env = environ.copy()
+    env["PYTHONPATH"] = str(project_dir_path / "server" / "py")
     env["MLRUN_HTTPDB__PORT"] = str(port)
     env["MLRUN_HTTPDB__DSN"] = (
         f"sqlite:///{workdir}/mlrun.sqlite3?check_same_thread=false"
@@ -72,7 +80,7 @@ def start_server(workdir, env_config: dict):
     cmd = [
         executable,
         "-m",
-        "server.api.main",
+        "services.api.main",
     ]
 
     proc = Popen(cmd, env=env, stdout=PIPE, stderr=PIPE, cwd=project_dir_path)
@@ -271,6 +279,10 @@ def test_runs(create_server):
     for i in range(count):
         uid = f"uid_{i}"
         run_as_dict["metadata"]["name"] = "run-name"
+        if i % 2 == 0:
+            run_as_dict["status"]["state"] = "completed"
+        else:
+            run_as_dict["status"]["state"] = "created"
         db.store_run(run_as_dict, uid, prj)
 
     # retrieve only the last run as it is partitioned by name
@@ -285,8 +297,20 @@ def test_runs(create_server):
     )
     assert len(runs) == 7, "bad number of runs"
 
+    # retrieve only created runs
+    runs = db.list_runs(project=prj, states=["created"])
+    assert len(runs) == 3, "bad number of runs"
+
+    # retrieve created and completed runs
+    runs = db.list_runs(project=prj, states=["created", "completed"])
+    assert len(runs) == 7, "bad number of runs"
+
     # delete runs in created state
     db.del_runs(project=prj, state="created")
+
+    # delete runs in completed state
+    db.del_runs(project=prj, state="completed")
+
     runs = db.list_runs(project=prj)
     assert not runs, "found runs in after delete"
 
@@ -323,8 +347,87 @@ def test_bearer_auth(create_server):
     with pytest.raises(mlrun.errors.MLRunUnauthorizedError):
         db.list_runs()
 
-    db.token = token
+    db.token_provider = StaticTokenProvider(token)
     db.list_runs()
+
+
+def test_client_id_auth(requests_mock: requests_mock_package.Mocker, monkeypatch):
+    """
+    Test the httpdb behavior when using a client-id OAuth token. Test verifies that:
+    - Token is retrieved successfully, and kept in the httpdb class.
+    - Token is added as Bearer token when issuing API calls to BE.
+    - Token is refreshed when its expiry time is nearing.
+    - Some error flows when token cannot be retrieved - such as that token is still used while it hasn't expired.
+    """
+
+    token_url = "https://mock/token_endpoint/protocol/openid-connect/token"
+    test_env = {
+        "MLRUN_AUTH_TOKEN_ENDPOINT": token_url,
+        "MLRUN_AUTH_CLIENT_ID": "some-client-id",
+        "MLRUN_AUTH_CLIENT_SECRET": "some-client-secret",
+    }
+
+    mlrun.mlconf.auth_with_client_id.enabled = True
+    for key, value in test_env.items():
+        monkeypatch.setenv(key, value)
+
+    expected_token = "my-cool-token"
+    # Set a 4-second expiry, so a refresh will happen in 2 seconds
+    requests_mock.post(
+        token_url, json={"access_token": expected_token, "expires_in": 4}
+    )
+
+    db_url = "http://mock-server:1919"
+    db = HTTPRunDB(db_url)
+    db.connect()
+    token = db.token_provider.get_token()
+    assert token == expected_token
+    assert len(requests_mock.request_history) == 1
+
+    time.sleep(1)
+    token = db.token_provider.get_token()
+    assert token == expected_token
+    # verify no additional calls were made (too early)
+    assert len(requests_mock.request_history) == 1
+
+    time.sleep(1.5)
+    expected_token = "my-other-cool-token"
+    requests_mock.post(
+        token_url, json={"access_token": expected_token, "expires_in": 3}
+    )
+    token = db.token_provider.get_token()
+    assert token == expected_token
+
+    # Check that httpdb attaches the token to API calls as Authorization header.
+    # Using trigger-migrations since it needs no payload and returns nothing, so easy to simulate.
+    requests_mock.post(f"{db_url}/api/v1/operations/migrations", status_code=200)
+    db.trigger_migrations()
+
+    expected_auth = f"Bearer {expected_token}"
+    last_request = requests_mock.last_request
+    assert last_request.headers["Authorization"] == expected_auth
+
+    # Check flow where we fail token retrieval while token is still active (not expired).
+    requests_mock.reset_mock()
+    requests_mock.post(token_url, status_code=401)
+
+    time.sleep(2)
+    db.trigger_migrations()
+
+    request_history = requests_mock.request_history
+    # We expect 2 calls - one for the token (which failed but didn't fail the flow) and one for the actual api call.
+    assert len(request_history) == 2
+    # The token should still be the previous token, since it was not refreshed but it's not expired yet.
+    assert request_history[-1].headers["Authorization"] == expected_auth
+
+    # Now let the token expire, and verify commands still go out, only without auth
+    time.sleep(2)
+    requests_mock.reset_mock()
+
+    db.trigger_migrations()
+    assert len(requests_mock.request_history) == 2
+    assert "Authorization" not in requests_mock.last_request.headers
+    assert db.token_provider.token is None
 
 
 def _generate_runtime(name) -> mlrun.runtimes.KubejobRuntime:
@@ -451,6 +554,53 @@ def _create_feature_set(name):
                     "top": "2016-05-25 13:30:00.222222",
                 }
             },
+            "preview": [
+                [
+                    "time",
+                    "bid",
+                    "ask",
+                ],
+                [
+                    "2016-05-25 13:30:00.222222",
+                    7.3,
+                    "10:30:00.222222",
+                ],
+                [
+                    "2016-05-24 13:30:00.222222",
+                    7.3,
+                    "11:30:00.222222",
+                ],
+                [
+                    "2016-05-23 13:30:00.222222",
+                    4.7,
+                    "13:20:00.222222",
+                ],
+                [
+                    "2016-05-22 13:30:00.222222",
+                    5.2,
+                    "13:15:00.222222",
+                ],
+                [
+                    "2016-05-21 13:30:00.222222",
+                    5,
+                    "18:30:00.222222",
+                ],
+                [
+                    "2016-05-20 13:30:00.222222",
+                    4.6,
+                    "09:30:00.222222",
+                ],
+                [
+                    "2016-05-19 13:30:00.222222",
+                    5.6,
+                    "08:30:00.222222",
+                ],
+                [
+                    "2016-05-24 13:30:00.222222",
+                    5.6,
+                    "13:30:00.222222",
+                ],
+            ],
         },
         "some_other_field": "blabla",
     }
@@ -484,7 +634,7 @@ def test_feature_sets(create_server):
         name, feature_set_update, project, tag="latest", patch_mode="additive"
     )
     feature_sets = db.list_feature_sets(project=project)
-    assert len(feature_sets) == count, "bad list results - wrong number of members"
+    assert len(feature_sets) == count
 
     feature_sets = db.list_feature_sets(
         project=project,
@@ -493,10 +643,27 @@ def test_feature_sets(create_server):
         partition_sort_by="updated",
         partition_order="desc",
     )
-    assert len(feature_sets) == count, "bad list results - wrong number of members"
+    assert len(feature_sets) == count
+    assert all([feature_set.status.stats for feature_set in feature_sets])
+    assert all([feature_set.status.preview for feature_set in feature_sets])
 
     feature_set = db.get_feature_set(name, project)
     assert len(feature_set.spec.features) == 4
+
+    # test minimal feature set format
+    feature_sets = db.list_feature_sets(
+        project=project,
+        partition_by="name",
+        rows_per_partition=1,
+        partition_sort_by="updated",
+        partition_order="desc",
+        format_=mlrun.common.formatters.FeatureSetFormat.minimal,
+    )
+    assert len(feature_sets) == count
+    assert not any([feature_set.status.stats for feature_set in feature_sets])
+    assert not any([feature_set.status.preview for feature_set in feature_sets])
+    assert not any([feature_set.metadata.updated for feature_set in feature_sets])
+    assert all([feature_set.status.state for feature_set in feature_sets])
 
     # Create a feature-set that has no labels
     name = "feature_set_no_labels"
@@ -618,32 +785,253 @@ def test_delete_artifact_tags(create_server):
     _assert_artifacts(db, proj_obj.name, tag, 0)
 
 
-def _generate_project_and_artifact(project: str = "newproj", tag: str = None):
-    proj_obj = mlrun.new_project(project)
+def test_add_tag_and_delete_untagged_artifacts(create_server):
+    _, db = _configure_run_db_server(create_server)
+    project_name = "artifact-project"
+    project = mlrun.new_project(project_name)
 
-    logged_artifact = proj_obj.log_artifact(
-        "my-artifact",
-        body=b"some data",
-        tag=tag,
+    # create 4 artifacts that are basically the same, but with different auto-generated trees to create different uids.
+    # only the last one will get the latest tag
+    artifact_key = "artifact_key"
+    # add a different db_key to simulate artifact created by a run
+    artifact_db_key = f"{project_name}-{artifact_key}"
+    num_artifacts = 4
+    for i in range(num_artifacts):
+        project.log_artifact(
+            artifact_key,
+            body=b"some data",
+            db_key=artifact_db_key,
+        )
+
+    # list all artifacts
+    artifacts = db.list_artifacts(project=project_name)
+    assert len(artifacts) == num_artifacts
+    artifact_tags = [artifact["metadata"].get("tag") for artifact in artifacts]
+    assert artifact_tags.count("latest") == 1
+    assert artifact_tags.count(None) == num_artifacts - 1
+
+    # find untagged artifacts and add a new tag to them
+    untagged_artifacts = [
+        artifact
+        for artifact in artifacts
+        if "tag" not in artifact["metadata"] or artifact["metadata"]["tag"] is None
+    ]
+    new_tags = []
+    for idx, untagged_artifact in enumerate(untagged_artifacts):
+        new_tag = f"new-tag-{idx}"
+        new_tags.append(new_tag)
+        db.tag_artifacts(untagged_artifact, project_name, tag_name=new_tag)
+
+    # verify the artifacts were tagged
+    artifact_tags = db.list_artifact_tags(project=project_name)
+    assert len(artifact_tags) == num_artifacts
+
+    artifacts = db.list_artifacts(project=project_name)
+    artifact_tags = [artifact["metadata"].get("tag") for artifact in artifacts]
+    assert len(artifact_tags) == num_artifacts
+    assert artifact_tags.count("latest") == 1
+    assert artifact_tags.count(None) == 0
+
+    # delete a single artifact with a new tag
+    db.del_artifact(
+        key=artifact_db_key,
+        tag=new_tags[0],
+        project=project_name,
     )
-    return proj_obj, logged_artifact
+
+    # list all artifacts
+    artifacts = db.list_artifacts(project=project_name)
+    assert len(artifacts) == num_artifacts - 1
+
+    # delete the rest of the artifacts with 'delete_artifacts'
+    artifacts_to_delete = [
+        artifact for artifact in artifacts if artifact["metadata"]["tag"] != "latest"
+    ]
+    for artifact_to_delete in artifacts_to_delete:
+        db.del_artifacts(
+            name=artifact_db_key,
+            tag=artifact_to_delete["metadata"]["tag"],
+            project=project_name,
+        )
+
+    # verify only the latest remained
+    artifacts = db.list_artifacts(project=project_name)
+    assert len(artifacts) == 1
+    assert artifacts[0]["metadata"]["tag"] == "latest"
 
 
-def _assert_artifacts(db, project: str, tag: str, expected_count: int):
-    artifacts = db.list_artifacts(project=project, tag=tag)
-    assert (
-        len(artifacts) == expected_count
-    ), "bad list results - wrong number of artifacts"
+def test_paginated_list_artifacts(create_server):
+    num_artifacts = 10
+    db, project_name = _store_artifacts(create_server, num_artifacts)
+    page_size = 4
+
+    # First request (Page 1)
+    artifacts, token = db.paginated_list_artifacts(
+        project=project_name, page_size=page_size
+    )
+    _assert_list_response(
+        artifacts,
+        expected_results_count=page_size,
+        identifier_name="key",
+        expected_first_result_name="artifact-9",
+    )
+    assert token is not None
+
+    # Second request using the token from the first response
+    artifacts, token = db.paginated_list_artifacts(
+        project=project_name, page_token=token
+    )
+    _assert_list_response(
+        artifacts,
+        expected_results_count=page_size,
+        identifier_name="key",
+        expected_first_result_name="artifact-5",
+    )
+    assert token is not None
+
+    # Third request, expecting fewer artifacts (last page)
+    artifacts, token = db.paginated_list_artifacts(
+        project=project_name, page_token=token
+    )
+    _assert_list_response(
+        artifacts,
+        expected_results_count=2,
+        identifier_name="key",
+        expected_first_result_name="artifact-1",
+    )
+    assert token is None
+
+    # Retrieve specific page (Page 3)
+    artifacts, token = db.paginated_list_artifacts(
+        project=project_name, page_size=page_size, page=3
+    )
+    _assert_list_response(
+        artifacts,
+        expected_results_count=2,
+        identifier_name="key",
+        expected_first_result_name="artifact-1",
+    )
+    assert token is None
+
+    # Automatically iterate over all pages without explicitly specifying the page number
+    artifacts = _retrieve_all_items_with_pagination(
+        project_name, page_size, db.paginated_list_artifacts
+    )
+    assert len(artifacts) == num_artifacts
 
 
-def _configure_run_db_server(create_server):
-    server: Server = create_server()
-    db: HTTPRunDB = server.conn
-    mlrun.mlconf.dbpath = server.url
-    mlrun.db._run_db = db
-    mlrun.db._last_db_url = server.url
+def test_paginated_list_functions(create_server):
+    num_functions = 10
+    db, project_name = _store_functions(create_server, num_functions)
+    page_size = 4
 
-    return server, db
+    # First request (Page 1)
+    functions, token = db.paginated_list_functions(
+        project=project_name, page_size=page_size
+    )
+    _assert_list_response(
+        functions,
+        expected_results_count=page_size,
+        identifier_name="name",
+        expected_first_result_name="function-9",
+    )
+    assert token is not None
+
+    # Second request using the token from the first response
+    functions, token = db.paginated_list_functions(
+        project=project_name, page_token=token
+    )
+    _assert_list_response(
+        functions,
+        expected_results_count=page_size,
+        identifier_name="name",
+        expected_first_result_name="function-5",
+    )
+    assert token is not None
+
+    # Third request, expecting fewer functions (last page)
+    functions, token = db.paginated_list_functions(
+        project=project_name, page_token=token
+    )
+    _assert_list_response(
+        functions,
+        expected_results_count=2,
+        identifier_name="name",
+        expected_first_result_name="function-1",
+    )
+    assert token is None
+
+    # Retrieve specific page (Page 3)
+    functions, token = db.paginated_list_functions(
+        project=project_name, page_size=page_size, page=3
+    )
+    _assert_list_response(
+        functions,
+        expected_results_count=2,
+        identifier_name="name",
+        expected_first_result_name="function-1",
+    )
+    assert token is None
+
+    # Automatically iterate over all pages without explicitly specifying the page number
+    functions = _retrieve_all_items_with_pagination(
+        project_name, page_size, db.paginated_list_functions
+    )
+    assert len(functions) == num_functions
+
+
+def test_paginated_list_runs(create_server):
+    num_runs = 10
+    db, project_name = _store_runs(create_server, num_runs)
+    page_size = 4
+
+    # First request (Page 1)
+    runs, token = db.paginated_list_runs(project=project_name, page_size=page_size)
+    _assert_list_response(
+        runs,
+        expected_results_count=page_size,
+        identifier_name="name",
+        expected_first_result_name="run-0",
+    )
+    assert token is not None
+
+    # Second request using the token from the first response
+    runs, token = db.paginated_list_runs(project=project_name, page_token=token)
+    _assert_list_response(
+        runs,
+        expected_results_count=page_size,
+        identifier_name="name",
+        expected_first_result_name="run-4",
+    )
+    assert token is not None
+
+    # Third request, expecting fewer runs (last page)
+    runs, token = db.paginated_list_runs(project=project_name, page_token=token)
+    _assert_list_response(
+        runs,
+        expected_results_count=2,
+        identifier_name="name",
+        expected_first_result_name="run-8",
+    )
+    assert token is None
+
+    # Retrieve specific page (Page 3)
+    runs, token = db.paginated_list_runs(
+        project=project_name, page_size=page_size, page=3
+    )
+    _assert_list_response(
+        runs,
+        expected_results_count=2,
+        identifier_name="name",
+        expected_first_result_name="run-8",
+    )
+    assert token is None
+
+    # Automatically iterate over all pages without explicitly specifying the page number
+    runs = _retrieve_all_items_with_pagination(
+        project_name, page_size, db.paginated_list_runs
+    )
+    assert len(runs) == num_runs
 
 
 def test_feature_vectors(create_server):
@@ -770,8 +1158,32 @@ def test_project_sql_db_roundtrip(create_server):
     _assert_projects(project, patched_project)
     get_project = db.get_project(project_name)
     _assert_projects(project, get_project)
-    list_projects = db.list_projects(format_=mlrun.common.schemas.ProjectsFormat.full)
+    list_projects = db.list_projects(format_=mlrun.common.formatters.ProjectFormat.full)
     _assert_projects(project, list_projects[0])
+
+
+@pytest.mark.parametrize(
+    "alert_name_in_config, alert_name_as_func_param",
+    [
+        (None, None),
+        (None, ""),
+        ("", None),
+        ("", ""),
+    ],
+)
+def test_store_alert_config_missing_alert_name(
+    alert_name_in_config, alert_name_as_func_param, create_server
+):
+    server: Server = create_server()
+    db: HTTPRunDB = server.conn
+    alert_data = mlrun.alerts.alert.AlertConfig(name=alert_name_in_config, project=None)
+    with pytest.raises(
+        mlrun.errors.MLRunInvalidArgumentError, match="Alert name must be provided"
+    ):
+        db.store_alert_config(
+            alert_name=alert_name_as_func_param,
+            alert_data=alert_data,
+        )
 
 
 def _assert_projects(expected_project, project):
@@ -790,3 +1202,101 @@ def _assert_projects(expected_project, project):
     )
     assert expected_project.spec.desired_state == project.spec.desired_state
     assert expected_project.spec.desired_state == project.status.state
+
+
+def _store_functions(create_server, num_functions: int) -> tuple[HTTPRunDB, str]:
+    db, project_name = _setup_project_and_db(create_server)
+    for i in range(num_functions):
+        name = f"function-{i}"
+        func = {"fid": i}
+        db.store_function(func, name, project_name)
+
+    return db, project_name
+
+
+def _store_artifacts(create_server, num_artifacts: int) -> tuple[HTTPRunDB, str]:
+    db, project_name = _setup_project_and_db(create_server)
+
+    for i in range(num_artifacts):
+        artifact_key = f"artifact-{i}"
+        artifact = mlrun.artifacts.Artifact(
+            artifact_key, body=b"some data", project=project_name
+        )
+        db.store_artifact(artifact_key, artifact)
+
+    return db, project_name
+
+
+def _store_runs(create_server, num_runs: int) -> tuple[HTTPRunDB, str]:
+    db, project_name = _setup_project_and_db(create_server)
+
+    run_as_dict = RunObject().to_dict()
+
+    for i in range(num_runs):
+        run_key = f"run-{i}"
+        run_as_dict["metadata"]["name"] = run_key
+        db.store_run(run_as_dict, uid=run_key, project=project_name)
+
+    return db, project_name
+
+
+def _setup_project_and_db(
+    create_server, project_name: str = "my-project"
+) -> tuple[HTTPRunDB, str]:
+    _, db = _configure_run_db_server(create_server)
+    project_obj = mlrun.new_project(project_name, save=False)
+    db.create_project(project_obj)
+    return db, project_name
+
+
+def _assert_list_response(
+    response,
+    expected_results_count: int,
+    identifier_name: str,
+    expected_first_result_name: str,
+):
+    assert len(response) == expected_results_count
+    assert response[0]["metadata"].get(identifier_name) == expected_first_result_name
+
+
+def _retrieve_all_items_with_pagination(
+    project_name: str, page_size: int, paginated_list_fn: typing.Callable
+) -> list:
+    items = []
+    token = None
+    while True:
+        page_items, token = paginated_list_fn(
+            project=project_name, page_token=token, page_size=page_size
+        )
+        items.extend(page_items)
+        if not token:  # If no token is returned, we've reached the last page
+            break
+    return items
+
+
+def _generate_project_and_artifact(project: str = "newproj", tag: Optional[str] = None):
+    proj_obj = mlrun.new_project(project)
+
+    logged_artifact = proj_obj.log_artifact(
+        "my-artifact",
+        body=b"some data",
+        tag=tag,
+    )
+    return proj_obj, logged_artifact
+
+
+def _assert_artifacts(db, project: str, tag: str, expected_count: int):
+    artifacts = db.list_artifacts(project=project, tag=tag)
+    assert (
+        len(artifacts) == expected_count
+    ), "bad list results - wrong number of artifacts"
+
+
+def _configure_run_db_server(create_server):
+    server: Server = create_server()
+    db: HTTPRunDB = server.conn
+    mlrun.mlconf.dbpath = server.url
+    mlrun.db._run_db = db
+    mlrun.db._last_db_url = server.url
+
+    return server, db

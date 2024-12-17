@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+from typing import Optional
+from urllib.parse import urlparse
 
 import fsspec
 
@@ -19,7 +21,9 @@ from mlrun.datastore.base import DataStore
 
 
 class HdfsStore(DataStore):
-    def __init__(self, parent, schema, name, endpoint="", secrets: dict = None):
+    def __init__(
+        self, parent, schema, name, endpoint="", secrets: Optional[dict] = None
+    ):
         super().__init__(parent, name, schema, endpoint, secrets)
 
         self.host = self._get_secret_or_env("HDFS_HOST")
@@ -49,3 +53,7 @@ class HdfsStore(DataStore):
     @property
     def spark_url(self):
         return f"hdfs://{self.host}:{self.port}"
+
+    def rm(self, url, recursive=False, maxdepth=None):
+        path = urlparse(url).path
+        self.filesystem.rm(path=path, recursive=recursive, maxdepth=maxdepth)

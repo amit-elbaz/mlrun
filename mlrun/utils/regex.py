@@ -86,9 +86,27 @@ tag_name = label_value
 
 secret_key = k8s_secret_and_config_map_key
 
-artifact_key = [r"[^\/\\]+$"]
+artifact_key = [r"^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$"]
 
 # must not start with _
 # must be alphanumeric or _
 # max 256 length
 v3io_stream_consumer_group = [r"^(?!_)[a-zA-Z0-9_]{1,256}$"]
+
+# URI patterns
+run_uri_pattern = r"^(?P<project>.*)@(?P<uid>.*)\#(?P<iteration>.*?)(:(?P<tag>.*))?$"
+
+artifact_uri_pattern = (
+    r"^((?P<project>.*)/)?"  # Optional project
+    r"(?P<key>.*?)"  # Key
+    r"(\#(?P<iteration>.*?))?"  # Optional iteration
+    r"(:(?P<tag>.*?))?"  # Optional tag
+    r"(@(?P<tree>.*?))?"  # Optional tree
+    r"(\^(?P<uid>.*))?$"  # Optional uid
+)
+
+artifact_producer_uri_pattern = (
+    r"^((?P<project>.*)/)?(?P<uid>.*?)(\-(?P<iteration>.*?))?$"
+)
+
+mail_regex = r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"

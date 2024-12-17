@@ -17,11 +17,6 @@ import typing
 
 import mlrun.common
 import mlrun.common.schemas.model_monitoring.constants as mm_constants
-from mlrun.common.schemas.model_monitoring import (
-    EndpointUID,
-    FunctionURI,
-    VersionedModel,
-)
 
 FeatureStats = typing.NewType("FeatureStats", dict[str, dict[str, typing.Any]])
 Histogram = typing.NewType("Histogram", list[list])
@@ -29,29 +24,6 @@ BinCounts = typing.NewType("BinCounts", list[int])
 BinEdges = typing.NewType("BinEdges", list[float])
 
 _MAX_FLOAT = sys.float_info.max
-
-
-def create_model_endpoint_uid(function_uri: str, versioned_model: str):
-    function_uri = FunctionURI.from_string(function_uri)
-    versioned_model = VersionedModel.from_string(versioned_model)
-
-    if (
-        not function_uri.project
-        or not function_uri.function
-        or not versioned_model.model
-    ):
-        raise ValueError("Both function_uri and versioned_model have to be initialized")
-
-    uid = EndpointUID(
-        function_uri.project,
-        function_uri.function,
-        function_uri.tag,
-        function_uri.hash_key,
-        versioned_model.model,
-        versioned_model.version,
-    )
-
-    return uid
 
 
 def parse_model_endpoint_project_prefix(path: str, project_name: str):
@@ -65,7 +37,7 @@ def parse_model_endpoint_store_prefix(store_prefix: str):
 
 
 def parse_monitoring_stream_path(
-    stream_uri: str, project: str, function_name: str = None
+    stream_uri: str, project: str, function_name: typing.Optional[str] = None
 ):
     if stream_uri.startswith("kafka://"):
         if "?topic" in stream_uri:

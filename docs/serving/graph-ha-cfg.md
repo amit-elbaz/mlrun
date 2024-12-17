@@ -7,7 +7,7 @@ This figure illustrates a simplistic flow of an MLRun serving graph with remote 
 As explained in {ref}`serving-graph`, the serving graph is based on Nuclio functions. 
 
 **In this section**
-- [Using Nuclio with stream triggers](#using-Nuclio-with-stream-triggers)
+- [Using Nuclio with stream triggers](#using-nuclio-with-stream-triggers)
 - [Consumer function configuration](#consumer-function-configuration)
 - [Remote function retry mechanism](#remote-function-retry-mechanism)
 - [Configuration considerations](#configuration-considerations)
@@ -25,7 +25,7 @@ stateful event processing.
 For stateful functions, each worker has its own state. See, for example, {py:meth}`~storey.transformations.MapWithState`.
 ```
 
-With Window ACK, the consumer group's committed offset is delayed by one window, committing the offset at (processed event num – window). 
+With Window ACK, the consumer group's committed offset is delayed by one window, committing the offset at (processed event number – window). 
 When the function restarts (for any reason including scale-up or scale-down), it starts consuming from this last committed point. 
 
 The size of the required Window ACK is based on the number of events that could be in processing when the function terminates. You can 
@@ -37,7 +37,7 @@ graph structure and should be calculated accordingly. The following sections exp
 A consumer function is essentially a Nuclio function with a stream trigger. As part of the trigger, you can set a consumer group.  
 
 The number of replicas per function depends on the  source:
-- `StreamSource`: The number of replicas is derived from the number of shards and is therefore nonconfigurable. Furthermore, the number of workers in each replica is set to 1 and also is not configurable.  
+- `StreamSource`: The number of replicas is derived from the number of shards and is therefore non-configurable. Furthermore, the number of workers in each replica is set to 1 and also is not configurable.  
 - `KafkaSource`: For Nuclio earlier than 1.12.10, it is 1 and non-configurable. For 1.12.10 and later, the number of replicas is set with, for example:
    - `function.spec.min_replicas = 2`. Default = 1
    - `function.spec.max_replicas = 3`. Default = 4	
@@ -57,7 +57,7 @@ To set the buffer size:
 
 The default `buffer_size` is 8 (messages).
 
-## Remote function retry mechanism 
+## Remote function retry mechanism
 
 The required processing time of a remote function varies, depending on the function. The system assumes a processing 
 time in the order of seconds, which affects the default configurations. However, some functions require a longer processing time. 

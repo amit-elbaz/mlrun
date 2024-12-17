@@ -21,6 +21,7 @@ import tempfile
 import pytest
 
 import mlrun.errors
+import mlrun.runtimes.mounts
 from mlrun.config import config as mlconf
 from mlrun.runtimes import KubejobRuntime
 from mlrun.runtimes.pod import AutoMountType
@@ -165,7 +166,7 @@ class TestAutoMount:
         through the request headers
         """
         os.environ[
-            mlrun.runtimes.constants.FunctionEnvironmentVariables.auth_session
+            mlrun.common.runtimes.constants.FunctionEnvironmentVariables.auth_session
         ] = "some-access-key"
 
         runtime = self._generate_runtime()
@@ -243,7 +244,7 @@ class TestAutoMount:
         mlconf.storage.auto_mount_params = pvc_params_str
 
         runtime = self._generate_runtime()
-        runtime.apply(mlrun.auto_mount())
+        runtime.apply(mlrun.runtimes.mounts.auto_mount())
         assert runtime.spec.disable_auto_mount
 
         self._execute_run(runtime)
@@ -253,9 +254,9 @@ class TestAutoMount:
         # This won't work if mount type is not pvc
         mlconf.storage.auto_mount_type = "auto"
         with pytest.raises(
-            ValueError, match="failed to auto mount, need to set env vars"
+            ValueError, match="Failed to auto mount, need to set env vars"
         ):
-            runtime.apply(mlrun.auto_mount())
+            runtime.apply(mlrun.runtimes.mounts.auto_mount())
 
     @staticmethod
     def _setup_s3_mount(use_secret, non_anonymous):

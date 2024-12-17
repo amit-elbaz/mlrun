@@ -13,6 +13,7 @@
 # limitations under the License.
 #
 import inspect
+from typing import Optional
 
 from mlrun.utils import get_in, update_in
 
@@ -46,7 +47,21 @@ def _update_result_body(result_path, event_body, result):
 class StepToDict:
     """auto serialization of graph steps to a python dictionary"""
 
-    def to_dict(self, fields: list = None, exclude: list = None, strip: bool = False):
+    meta_keys = [
+        "context",
+        "name",
+        "input_path",
+        "result_path",
+        "full_event",
+        "kwargs",
+    ]
+
+    def to_dict(
+        self,
+        fields: Optional[list] = None,
+        exclude: Optional[list] = None,
+        strip: bool = False,
+    ):
         """convert the step object to a python dictionary"""
         fields = fields or getattr(self, "_dict_fields", None)
         if not fields:
@@ -54,24 +69,16 @@ class StepToDict:
         if exclude:
             fields = [field for field in fields if field not in exclude]
 
-        meta_keys = [
-            "context",
-            "name",
-            "input_path",
-            "result_path",
-            "full_event",
-            "kwargs",
-        ]
         args = {
             key: getattr(self, key)
             for key in fields
-            if getattr(self, key, None) is not None and key not in meta_keys
+            if getattr(self, key, None) is not None and key not in self.meta_keys
         }
         # add storey kwargs or extra kwargs
         if "kwargs" in fields and (hasattr(self, "kwargs") or hasattr(self, "_kwargs")):
             kwargs = getattr(self, "kwargs", {}) or getattr(self, "_kwargs", {})
             for key, value in kwargs.items():
-                if key not in meta_keys:
+                if key not in self.meta_keys:
                     args[key] = value
 
         mod_name = self.__class__.__module__
@@ -80,7 +87,9 @@ class StepToDict:
             class_path = f"{mod_name}.{class_path}"
         struct = {
             "class_name": class_path,
-            "name": self.name or self.__class__.__name__,
+            "name": self.name
+            if hasattr(self, "name") and self.name
+            else self.__class__.__name__,
             "class_args": args,
         }
         if hasattr(self, "_STEP_KIND"):
@@ -94,8 +103,18 @@ class StepToDict:
         return struct
 
 
+class MonitoringApplicationToDict(StepToDict):
+    _STEP_KIND = "monitoring_application"
+    meta_keys = []
+
+
 class RouterToDict(StepToDict):
     _STEP_KIND = "router"
 
-    def to_dict(self, fields: list = None, exclude: list = None, strip: bool = False):
+    def to_dict(
+        self,
+        fields: Optional[list] = None,
+        exclude: Optional[list] = None,
+        strip: bool = False,
+    ):
         return super().to_dict(exclude=["routes"], strip=strip)

@@ -15,7 +15,7 @@
 from datetime import datetime
 from typing import Any, Literal, Optional, Union
 
-from pydantic import BaseModel
+from pydantic.v1 import BaseModel
 
 import mlrun.common.types
 from mlrun.common.schemas.auth import Credentials
@@ -96,7 +96,7 @@ class ScheduleUpdate(BaseModel):
     scheduled_object: Optional[Any]
     cron_trigger: Optional[Union[str, ScheduleCronTrigger]]
     desired_state: Optional[str]
-    labels: Optional[dict] = {}
+    labels: Optional[dict] = None
     concurrency_limit: Optional[int]
     credentials: Credentials = Credentials()
 

@@ -15,16 +15,15 @@
 import threading
 import time
 import traceback
-from typing import Union
+from typing import Optional, Union
 
-import mlrun.common.model_monitoring
+import mlrun.artifacts
+import mlrun.common.model_monitoring.helpers
 import mlrun.common.schemas.model_monitoring
-from mlrun.artifacts import ModelArtifact  # noqa: F401
-from mlrun.config import config
-from mlrun.errors import err_to_str
+import mlrun.model_monitoring
 from mlrun.utils import logger, now_date
 
-from ..common.helpers import parse_versioned_object_uri
+from ..common.schemas.model_monitoring import ModelEndpointSchema
 from .server import GraphServer
 from .utils import StepToDict, _extract_input_data, _update_result_body
 
@@ -33,12 +32,13 @@ class V2ModelServer(StepToDict):
     def __init__(
         self,
         context=None,
-        name: str = None,
-        model_path: str = None,
+        name: Optional[str] = None,
+        model_path: Optional[str] = None,
         model=None,
         protocol=None,
-        input_path: str = None,
-        result_path: str = None,
+        input_path: Optional[str] = None,
+        result_path: Optional[str] = None,
+        shard_by_endpoint: Optional[bool] = None,
         **kwargs,
     ):
         """base model serving class (v2), using similar API to KFServing v2 and Triton
@@ -91,6 +91,8 @@ class V2ModelServer(StepToDict):
                               this require that the event body will behave like a dict, example:
                               event: {"x": 5} , result_path="resp" means the returned response will be written
                               to event["y"] resulting in {"x": 5, "resp": <result>}
+        :param shard_by_endpoint: whether to use the endpoint as the partition/sharding key when writing to model
+                                  monitoring stream. Defaults to True.
         :param kwargs:     extra arguments (can be accessed using self.get_param(key))
         """
         self.name = name
@@ -102,24 +104,21 @@ class V2ModelServer(StepToDict):
         self.error = ""
         self.protocol = protocol or "v2"
         self.model_path = model_path
-        self.model_spec: mlrun.artifacts.ModelArtifact = None
+        self.model_spec: Optional[mlrun.artifacts.ModelArtifact] = None
         self._input_path = input_path
         self._result_path = result_path
         self._kwargs = kwargs  # for to_dict()
         self._params = kwargs
-        self._model_logger = (
-            _ModelLogPusher(self, context)
-            if context and context.stream.enabled
-            else None
-        )
-
         self.metrics = {}
         self.labels = {}
         self.model = None
         if model:
             self.model = model
             self.ready = True
+        self._versioned_model_name = None
         self.model_endpoint_uid = None
+        self.shard_by_endpoint = shard_by_endpoint
+        self._model_logger = None
 
     def _load_and_update_state(self):
         try:
@@ -148,10 +147,15 @@ class V2ModelServer(StepToDict):
             logger.warn("GraphServer not initialized for VotingEnsemble instance")
             return
 
-        if not self.context.is_mock or self.context.server.track_models:
+        if not self.context.is_mock or self.context.monitoring_mock:
             self.model_endpoint_uid = _init_endpoint_record(
                 graph_server=server, model=self
             )
+        self._model_logger = (
+            _ModelLogPusher(self, self.context)
+            if self.context and self.context.stream.enabled
+            else None
+        )
 
     def get_param(self, key: str, default=None):
         """get param by key (specified in the model or the function)"""
@@ -193,13 +197,15 @@ class V2ModelServer(StepToDict):
             extra dataitems dictionary
 
         """
-        model_file, self.model_spec, extra_dataitems = mlrun.artifacts.get_model(
-            self.model_path, suffix
-        )
-        if self.model_spec and self.model_spec.parameters:
-            for key, value in self.model_spec.parameters.items():
-                self._params[key] = value
-        return model_file, extra_dataitems
+        if self.model_path:
+            model_file, self.model_spec, extra_dataitems = mlrun.artifacts.get_model(
+                self.model_path, suffix
+            )
+            if self.model_spec and self.model_spec.parameters:
+                for key, value in self.model_spec.parameters.items():
+                    self._params[key] = value
+            return model_file, extra_dataitems
+        return None, None
 
     def load(self):
         """model loading function, see also .get_model() method"""
@@ -225,6 +231,23 @@ class V2ModelServer(StepToDict):
         request = self.preprocess(event_body, op)
         return self.validate(request, op)
 
+    @property
+    def versioned_model_name(self):
+        if self._versioned_model_name:
+            return self._versioned_model_name
+
+        # Generating version model value based on the model name and model version
+        if self.model_path and self.model_path.startswith("store://"):
+            # Enrich the model server with the model artifact metadata
+            self.get_model()
+            if not self.version:
+                # Enrich the model version with the model artifact tag
+                self.version = self.model_spec.tag
+            self.labels = self.model_spec.labels
+        version = self.version or "latest"
+        self._versioned_model_name = f"{self.name}:{version}"
+        return self._versioned_model_name
+
     def do_event(self, event, *args, **kwargs):
         """main model event handler method"""
         start = now_date()
@@ -232,6 +255,11 @@ class V2ModelServer(StepToDict):
         event_body = _extract_input_data(self._input_path, event.body)
         event_id = event.id
         op = event.path.strip("/")
+
+        partition_key = (
+            self.model_endpoint_uid if self.shard_by_endpoint is not False else None
+        )
+
         if event_body and isinstance(event_body, dict):
             op = op or event_body.get("operation")
             event_id = event_body.get("id", event_id)
@@ -251,13 +279,20 @@ class V2ModelServer(StepToDict):
             except Exception as exc:
                 request["id"] = event_id
                 if self._model_logger:
-                    self._model_logger.push(start, request, op=op, error=exc)
+                    self._model_logger.push(
+                        start,
+                        request,
+                        op=op,
+                        error=exc,
+                        partition_key=partition_key,
+                    )
                 raise exc
 
             response = {
                 "id": event_id,
                 "model_name": self.name,
                 "outputs": outputs,
+                "timestamp": start.isoformat(sep=" ", timespec="microseconds"),
             }
             if self.version:
                 response["model_version"] = self.version
@@ -287,7 +322,7 @@ class V2ModelServer(StepToDict):
             setattr(event, "terminated", True)
             event_body = {
                 "name": self.name,
-                "version": self.version,
+                "version": self.version or "",
                 "inputs": [],
                 "outputs": [],
             }
@@ -307,7 +342,13 @@ class V2ModelServer(StepToDict):
             except Exception as exc:
                 request["id"] = event_id
                 if self._model_logger:
-                    self._model_logger.push(start, request, op=op, error=exc)
+                    self._model_logger.push(
+                        start,
+                        request,
+                        op=op,
+                        error=exc,
+                        partition_key=partition_key,
+                    )
                 raise exc
 
             response = {
@@ -331,11 +372,20 @@ class V2ModelServer(StepToDict):
         if self._model_logger:
             inputs, outputs = self.logged_results(request, response, op)
             if inputs is None and outputs is None:
-                self._model_logger.push(start, request, response, op)
+                self._model_logger.push(
+                    start, request, response, op, partition_key=partition_key
+                )
             else:
                 track_request = {"id": event_id, "inputs": inputs or []}
                 track_response = {"outputs": outputs or []}
-                self._model_logger.push(start, track_request, track_response, op)
+                # TODO : check dict/list
+                self._model_logger.push(
+                    start,
+                    track_request,
+                    track_response,
+                    op,
+                    partition_key=partition_key,
+                )
         event.body = _update_result_body(self._result_path, original_body, response)
         return event
 
@@ -376,8 +426,10 @@ class V2ModelServer(StepToDict):
         """postprocess, before returning response"""
         return request
 
-    def predict(self, request: dict) -> dict:
-        """model prediction operation"""
+    def predict(self, request: dict) -> list:
+        """model prediction operation
+        :return: list with the model prediction results (can be multi-port) or list of lists for multiple predictions
+        """
         raise NotImplementedError()
 
     def explain(self, request: dict) -> dict:
@@ -423,7 +475,7 @@ class V2ModelServer(StepToDict):
 
 
 class _ModelLogPusher:
-    def __init__(self, model, context, output_stream=None):
+    def __init__(self, model: V2ModelServer, context, output_stream=None):
         self.model = model
         self.verbose = context.verbose
         self.hostname = context.stream.hostname
@@ -445,12 +497,13 @@ class _ModelLogPusher:
             "version": self.model.version,
             "host": self.hostname,
             "function_uri": self.function_uri,
+            "endpoint_id": self.model.model_endpoint_uid,
         }
         if getattr(self.model, "labels", None):
             base_data["labels"] = self.model.labels
         return base_data
 
-    def push(self, start, request, resp=None, op=None, error=None):
+    def push(self, start, request, resp=None, op=None, error=None, partition_key=None):
         start_str = start.isoformat(sep=" ", timespec="microseconds")
         if error:
             data = self.base_data()
@@ -461,7 +514,7 @@ class _ModelLogPusher:
             if self.verbose:
                 message = f"{message}\n{traceback.format_exc()}"
             data["error"] = message
-            self.output_stream.push([data])
+            self.output_stream.push([data], partition_key=partition_key)
             return
 
         self._sample_iter = (self._sample_iter + 1) % self.stream_sample
@@ -487,7 +540,7 @@ class _ModelLogPusher:
                         "metrics",
                     ]
                     data["values"] = self._batch
-                    self.output_stream.push([data])
+                    self.output_stream.push([data], partition_key=partition_key)
             else:
                 data = self.base_data()
                 data["request"] = request
@@ -497,7 +550,7 @@ class _ModelLogPusher:
                 data["microsec"] = microsec
                 if getattr(self.model, "metrics", None):
                     data["metrics"] = self.model.metrics
-                self.output_stream.push([data])
+                self.output_stream.push([data], partition_key=partition_key)
 
 
 def _init_endpoint_record(
@@ -516,70 +569,122 @@ def _init_endpoint_record(
     """
 
     logger.info("Initializing endpoint records")
-
-    # Generate required values for the model endpoint record
+    if not model.model_spec:
+        model.get_model()
+    if model.model_spec:
+        model_name = model.model_spec.metadata.key
+        model_db_key = model.model_spec.spec.db_key
+        model_uid = model.model_spec.metadata.uid
+        model_tag = model.model_spec.tag
+        model_labels = model.model_spec.labels  # todo : check if we still need this
+    else:
+        model_name = None
+        model_db_key = None
+        model_uid = None
+        model_tag = None
+        model_labels = {}
     try:
-        # Getting project name from the function uri
-        project, uri, tag, hash_key = parse_versioned_object_uri(
-            graph_server.function_uri
+        model_ep = mlrun.get_run_db().get_model_endpoint(
+            project=graph_server.project,
+            name=model.name,
+            function_name=graph_server.function_name,
+            function_tag=graph_server.function_tag or "latest",
         )
-    except Exception as e:
-        logger.error("Failed to parse function URI", exc=err_to_str(e))
+    except mlrun.errors.MLRunNotFoundError:
+        model_ep = None
+    except mlrun.errors.MLRunBadRequestError as err:
+        logger.info(
+            "Cannot get the model endpoints store", err=mlrun.errors.err_to_str(err)
+        )
+        return
+
+    function = mlrun.get_run_db().get_function(
+        name=graph_server.function_name,
+        project=graph_server.project,
+        tag=graph_server.function_tag or "latest",
+    )
+    function_uid = function.get("metadata", {}).get("uid")
+    if not model_ep and model.context.server.track_models:
+        logger.info(
+            "Creating a new model endpoint record",
+            name=model.name,
+            project=graph_server.project,
+            function_name=graph_server.function_name,
+            function_tag=graph_server.function_tag or "latest",
+            function_uid=function_uid,
+            model_name=model_name,
+            model_tag=model_tag,
+            model_db_key=model_db_key,
+            model_uid=model_uid,
+            model_class=model.__class__.__name__,
+        )
+        model_ep = mlrun.common.schemas.ModelEndpoint(
+            metadata=mlrun.common.schemas.ModelEndpointMetadata(
+                project=graph_server.project,
+                labels=model_labels,
+                name=model.name,
+                endpoint_type=mlrun.common.schemas.model_monitoring.EndpointType.NODE_EP,
+            ),
+            spec=mlrun.common.schemas.ModelEndpointSpec(
+                function_name=graph_server.function_name,
+                function_uid=function_uid,
+                function_tag=graph_server.function_tag or "latest",
+                model_name=model_name,
+                model_db_key=model_db_key,
+                model_uid=model_uid,
+                model_class=model.__class__.__name__,
+                model_tag=model_tag,
+            ),
+            status=mlrun.common.schemas.ModelEndpointStatus(
+                monitoring_mode=mlrun.common.schemas.model_monitoring.ModelMonitoringMode.enabled
+                if model.context.server.track_models
+                else mlrun.common.schemas.model_monitoring.ModelMonitoringMode.disabled,
+            ),
+        )
+        db = mlrun.get_run_db()
+        model_ep = db.create_model_endpoint(model_endpoint=model_ep)
+
+    elif model_ep:
+        attributes = {}
+        if function_uid != model_ep.spec.function_uid:
+            attributes[ModelEndpointSchema.FUNCTION_UID] = function_uid
+        if model_name != model_ep.spec.model_name:
+            attributes[ModelEndpointSchema.MODEL_NAME] = model_name
+        if model_uid != model_ep.spec.model_uid:
+            attributes[ModelEndpointSchema.MODEL_UID] = model_uid
+        if model_tag != model_ep.spec.model_tag:
+            attributes[ModelEndpointSchema.MODEL_TAG] = model_tag
+        if model_db_key != model_ep.spec.model_db_key:
+            attributes[ModelEndpointSchema.MODEL_DB_KEY] = model_db_key
+        if model_labels != model_ep.metadata.labels:
+            attributes[ModelEndpointSchema.LABELS] = model_labels
+        if model.__class__.__name__ != model_ep.spec.model_class:
+            attributes[ModelEndpointSchema.MODEL_CLASS] = model.__class__.__name__
+        if (
+            model_ep.status.monitoring_mode
+            == mlrun.common.schemas.model_monitoring.ModelMonitoringMode.enabled
+        ) != model.context.server.track_models:
+            attributes[ModelEndpointSchema.MONITORING_MODE] = (
+                mlrun.common.schemas.model_monitoring.ModelMonitoringMode.enabled
+                if model.context.server.track_models
+                else mlrun.common.schemas.model_monitoring.ModelMonitoringMode.disabled
+            )
+        if attributes:
+            logger.info(
+                "Updating model endpoint attributes",
+                attributes=attributes,
+                project=model_ep.metadata.project,
+                name=model_ep.metadata.name,
+                function_name=model_ep.spec.function_name,
+            )
+            db = mlrun.get_run_db()
+            model_ep = db.patch_model_endpoint(
+                project=model_ep.metadata.project,
+                name=model_ep.metadata.name,
+                endpoint_id=model_ep.metadata.uid,
+                attributes=attributes,
+            )
+    else:
         return None
 
-    # Generating version model value based on the model name and model version
-    if model.version:
-        versioned_model_name = f"{model.name}:{model.version}"
-    else:
-        versioned_model_name = f"{model.name}:latest"
-
-    # Generating model endpoint ID based on function uri and model version
-    uid = mlrun.common.model_monitoring.create_model_endpoint_uid(
-        function_uri=graph_server.function_uri, versioned_model=versioned_model_name
-    ).uid
-
-    # If model endpoint object was found in DB, skip the creation process.
-    try:
-        mlrun.get_run_db().get_model_endpoint(project=project, endpoint_id=uid)
-
-    except mlrun.errors.MLRunNotFoundError:
-        logger.info("Creating a new model endpoint record", endpoint_id=uid)
-
-        try:
-            model_endpoint = mlrun.common.schemas.ModelEndpoint(
-                metadata=mlrun.common.schemas.ModelEndpointMetadata(
-                    project=project, labels=model.labels, uid=uid
-                ),
-                spec=mlrun.common.schemas.ModelEndpointSpec(
-                    function_uri=graph_server.function_uri,
-                    model=versioned_model_name,
-                    model_class=model.__class__.__name__,
-                    model_uri=model.model_path,
-                    stream_path=config.model_endpoint_monitoring.store_prefixes.default.format(
-                        project=project, kind="stream"
-                    ),
-                    active=True,
-                    monitoring_mode=mlrun.common.schemas.model_monitoring.ModelMonitoringMode.enabled
-                    if model.context.server.track_models
-                    else mlrun.common.schemas.model_monitoring.ModelMonitoringMode.disabled,
-                ),
-                status=mlrun.common.schemas.ModelEndpointStatus(
-                    endpoint_type=mlrun.common.schemas.model_monitoring.EndpointType.NODE_EP
-                ),
-            )
-
-            db = mlrun.get_run_db()
-
-            db.create_model_endpoint(
-                project=project,
-                endpoint_id=uid,
-                model_endpoint=model_endpoint.dict(),
-            )
-
-        except Exception as e:
-            logger.error("Failed to create endpoint record", exc=err_to_str(e))
-
-    except Exception as e:
-        logger.error("Failed to retrieve model endpoint object", exc=err_to_str(e))
-
-    return uid
+    return model_ep.metadata.uid

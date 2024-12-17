@@ -17,9 +17,10 @@ import datetime
 from collections.abc import Generator
 from io import StringIO
 
-import pydantic
+import pydantic.v1
 import pytest
 
+import mlrun
 from mlrun.utils.helpers import now_date
 from mlrun.utils.logger import FormatterKinds, Logger, create_logger
 
@@ -59,7 +60,7 @@ def test_log_arbitrary_structures(make_stream_logger):
     class UnboundClass:
         pass
 
-    class SomePydanticObject(pydantic.BaseModel):
+    class SomePydanticObject(pydantic.v1.BaseModel):
         name: str
         date: datetime.datetime
 
@@ -78,11 +79,11 @@ def test_log_arbitrary_structures(make_stream_logger):
 
     # pydantic
     assert now_date_instance.isoformat() in log_line
-    assert '"name":"some-name"' in log_line
+    assert '"name":"some-name"' in log_line or "'name': 'some-name'" in log_line
 
     # dataclass
     assert another_now_date_instance.isoformat() in log_line
-    assert '"name":"another-name"' in log_line
+    assert '"name":"another-name"' in log_line or "'name': 'another-name'" in log_line
 
     # unbound class
     assert "UnboundClass" in log_line
@@ -177,3 +178,29 @@ def test_child_logger():
     # validate parent and child log lines
     assert "test-logger:debug" in log_lines[0]
     assert "test-logger.child:debug" in log_lines[1]
+
+
+def test_custom_logger():
+    stream = StringIO()
+    format = "> {timestamp} [{level}] Running module: {module} {message} {more}"
+    current_time = datetime.datetime.now()
+
+    # Format the current time in the same format as the given timestamp
+    formatted_time = current_time.strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+    expected_logger = (
+        f"> {formatted_time} [debug] Running module: logger test custom : "
+        + '{"a":1,"b":2}'
+    )
+    mlrun.mlconf.log_format_override = format
+    logger = create_logger(
+        "debug",
+        name="test-logger",
+        stream=stream,
+        formatter_kind=FormatterKinds.CUSTOM.name,
+    )
+    logger.debug("test custom", a=1, b=2)
+    # Remove the timestamp from the logger to avoid tests failing on millisecond differences
+    log_lines = stream.getvalue().strip().splitlines()
+    expected_logger = "[" + expected_logger.split("[")[-1]
+    logger_format = "[" + log_lines[0].split("[")[-1]
+    assert logger_format == expected_logger

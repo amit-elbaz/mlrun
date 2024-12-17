@@ -14,7 +14,7 @@
 #
 import typing
 
-import pydantic
+import pydantic.v1
 
 import mlrun.common.types
 
@@ -43,14 +43,20 @@ class NuclioStreamsFeatureFlag(mlrun.common.types.StrEnum):
     disabled = "disabled"
 
 
-class FeatureFlags(pydantic.BaseModel):
+class FeatureFlags(pydantic.v1.BaseModel):
     project_membership: ProjectMembershipFeatureFlag
     authentication: AuthenticationFeatureFlag
     nuclio_streams: NuclioStreamsFeatureFlag
     preemption_nodes: PreemptionNodesFeatureFlag
 
 
-class FrontendSpec(pydantic.BaseModel):
+class ArtifactLimits(pydantic.v1.BaseModel):
+    max_chunk_size: int
+    max_preview_size: int
+    max_download_size: int
+
+
+class FrontendSpec(pydantic.v1.BaseModel):
     jobs_dashboard_url: typing.Optional[str]
     model_monitoring_dashboard_url: typing.Optional[str]
     abortable_function_kinds: list[str] = []
@@ -70,3 +76,5 @@ class FrontendSpec(pydantic.BaseModel):
     feature_store_data_prefixes: typing.Optional[dict[str, str]]
     allowed_artifact_path_prefixes_list: list[str]
     ce: typing.Optional[dict]
+    internal_labels: list[str] = []
+    artifact_limits: ArtifactLimits

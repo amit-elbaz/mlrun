@@ -15,7 +15,7 @@
 import inspect
 from abc import ABCMeta
 from types import MethodType
-from typing import Any, Union
+from typing import Any, Optional, Union
 
 import docstring_parser
 
@@ -34,7 +34,7 @@ class _DefaultPackagerMeta(ABCMeta):
     dynamically generated docstring that will include a summary of the packager.
     """
 
-    def __new__(mcls, name: str, bases: tuple, namespace: dict, **kwargs):
+    def __new__(cls, name: str, bases: tuple, namespace: dict, **kwargs):
         """
         Create a new DefaultPackager metaclass that saves the original packager docstring to another attribute named
         `_packager_doc`.
@@ -48,7 +48,7 @@ class _DefaultPackagerMeta(ABCMeta):
         namespace["_packager_doc"] = namespace.get("__doc__", "")
 
         # Continue creating the metaclass:
-        return super().__new__(mcls, name, bases, namespace, **kwargs)
+        return super().__new__(cls, name, bases, namespace, **kwargs)
 
     @property
     def __doc__(cls: type["DefaultPackager"]) -> str:
@@ -323,9 +323,9 @@ class DefaultPackager(Packager, metaclass=_DefaultPackagerMeta):
     def pack(
         self,
         obj: Any,
-        key: str = None,
-        artifact_type: str = None,
-        configurations: dict = None,
+        key: Optional[str] = None,
+        artifact_type: Optional[str] = None,
+        configurations: Optional[dict] = None,
     ) -> Union[tuple[Artifact, dict], dict]:
         """
         Pack an object as the given artifact type using the provided configurations.
@@ -361,8 +361,8 @@ class DefaultPackager(Packager, metaclass=_DefaultPackagerMeta):
     def unpack(
         self,
         data_item: DataItem,
-        artifact_type: str = None,
-        instructions: dict = None,
+        artifact_type: Optional[str] = None,
+        instructions: Optional[dict] = None,
     ) -> Any:
         """
         Unpack the data item's artifact by the provided type using the given instructions.
@@ -399,7 +399,10 @@ class DefaultPackager(Packager, metaclass=_DefaultPackagerMeta):
         return unpack_method(data_item, **instructions)
 
     def is_packable(
-        self, obj: Any, artifact_type: str = None, configurations: dict = None
+        self,
+        obj: Any,
+        artifact_type: Optional[str] = None,
+        configurations: Optional[dict] = None,
     ) -> bool:
         """
         Check if this packager can pack an object of the provided type as the provided artifact type.
@@ -480,10 +483,10 @@ class DefaultPackager(Packager, metaclass=_DefaultPackagerMeta):
         self,
         data_item: DataItem,
         pickle_module_name: str = DEFAULT_PICKLE_MODULE,
-        object_module_name: str = None,
-        python_version: str = None,
-        pickle_module_version: str = None,
-        object_module_version: str = None,
+        object_module_name: Optional[str] = None,
+        python_version: Optional[str] = None,
+        pickle_module_version: Optional[str] = None,
+        object_module_version: Optional[str] = None,
     ) -> Any:
         """
         Unpack the data item's object, unpickle it using the instructions, and return.

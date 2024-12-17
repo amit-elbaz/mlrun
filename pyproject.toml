@@ -1,6 +1,6 @@
 [tool.ruff]
-extend-include = ["*.ipynb"]
 target-version = "py39"
+required-version = ">=0.8.0"
 
 [tool.ruff.lint]
 extend-select = [
@@ -8,11 +8,17 @@ extend-select = [
     "W",   # pycodestyle
     "E",   # pycodestyle
     "I",   # isort
+    "N",   # pep8-naming
     "UP",  # pyupgrade
     "CPY", # flake8-copyright
+    "B006", # mutable default arguments
+    "RUF013",  # forbid implicit `Optional` type hints
 ]
-exclude = ["*.ipynb"]
 explicit-preview-rules = true
+
+[tool.ruff.lint.isort]
+known-first-party = ["mlrun", "mlrun_pipelines"]
+known-local-folder = ["services", "framework"]
 
 [tool.ruff.lint.pycodestyle]
 max-line-length = 120
@@ -20,6 +26,7 @@ max-line-length = 120
 [tool.ruff.lint.extend-per-file-ignores]
 "__init__.py" = ["F401"]
 "docs/**.py" = ["CPY001"]
+"*.ipynb" = ["ALL"]  # TODO: enable linting rules on Jupyter notebooks
 
 [tool.ruff.lint.flake8-copyright]
 author = "Iguazio"
@@ -27,20 +34,31 @@ author = "Iguazio"
 [tool.ruff.format]
 docstring-code-format = true
 
+[tool.uv.pip]
+python-version = "3.9"  # the same as MLRUN_PYTHON_VERSION in the Makefile
+generate-hashes = true
+universal = true
+
 [tool.pytest.ini_options]
 addopts = "-v -rf --disable-warnings"
+pythonpath = "./server/py" # This allows running server side tests from the project root directory
 python_files = [
     "tests/*/test_*.py",
     "tests/test_*.py",
+    "server/py/*/tests/unit/test_*.py",
+    "server/py/*/tests/unit/*/test_*.py",
 ]
 timeout = 1800  # 30 minutes per test
 log_cli = true
 log_level = "DEBUG"
+asyncio_mode = "auto"
 
 [tool.importlinter]
 root_packages = [
     "mlrun",
-    "server",
+    "tests",
+    "server.py.services",
+    "server.py.framework",
 ]
 include_external_packages = true
 
@@ -51,7 +69,6 @@ source_modules = [
     "mlrun.common",
 ]
 forbidden_modules = [
-    "mlrun.api",
     "mlrun.artifacts",
     "mlrun.data_types",
     "mlrun.datastore",
@@ -69,7 +86,6 @@ forbidden_modules = [
     "mlrun.execution",
     "mlrun.features",
     "mlrun.k8s_utils",
-    "mlrun.kfpops",
     "mlrun.lists",
     "mlrun.model",
     "mlrun.render",
@@ -83,44 +99,61 @@ ignore_imports = [
 ]
 
 [[tool.importlinter.contracts]]
+name = "MLRun should not directly import kfp [use mlrun_pipelines instead]"
+type = "forbidden"
+source_modules = [
+    "mlrun",
+    "services",
+    "framework",
+    "server.py.services",
+    "server.py.framework",
+]
+forbidden_modules = [
+    "kfp",
+]
+
+[[tool.importlinter.contracts]]
 name = "MLRun server may import mlrun but not the way around"
 type = "layers"
 layers = [
-    "server",
+    "server.py.services",
+    "services",
+    "framework",
     "mlrun",
 ]
 
 [[tool.importlinter.contracts]]
-name = "MLRun should not import mlrun.api"
+name = "MLRun tests shouldn't import server code"
 type = "forbidden"
 source_modules = [
-    "server.api",
-    "mlrun.common",
-    "mlrun.artifacts",
-    "mlrun.data_types",
-    "mlrun.datastore",
-    "mlrun.db",
-    "mlrun.feature_store",
-    "mlrun.frameworks",
-    "mlrun.launcher",
-    "mlrun.model_monitoring",
-    "mlrun.package",
-    "mlrun.platforms",
-    "mlrun.projects",
-    "mlrun.runtimes",
-    "mlrun.serving",
-    "mlrun.track",
-    "mlrun.execution",
-    "mlrun.features",
-    "mlrun.k8s_utils",
-    "mlrun.kfpops",
-    "mlrun.lists",
-    "mlrun.model",
-    "mlrun.render",
-    "mlrun.run",
-    "mlrun.secrets",
+    "tests",
 ]
-allow_indirect_imports=false
 forbidden_modules = [
-    "mlrun.api",
+    "services",
+    "framework",
+    "server.py.services",
+    "server.py.framework",
+]
+# Ignore integration tests until we have service specific integration tests infrastructure
+ignore_imports = [
+    "tests.integration.sdk_api.alerts.test_alerts -> framework",
+]
+
+[[tool.importlinter.contracts]]
+name = "MLRun common server code should not import specific services"
+type = "forbidden"
+source_modules = [
+    "server.py.framework",
+]
+forbidden_modules = [
+    "services",
+]
+# TODO: Remove when crud moves to framework
+ignore_imports = [
+    "server.py.framework.api.utils -> services",
+    "server.py.framework.rundb.sqldb -> services",
+    "server.py.framework.utils.projects.* -> services",
+    "server.py.framework.utils.notifications -> services",
+    "server.py.framework.tests.unit.common_fixtures -> services",
+    "server.py.framework.tests.unit.db.common_fixtures -> services",
 ]

@@ -18,8 +18,10 @@ import pytest
 from kfp import dsl
 
 import mlrun
+import mlrun.runtimes.mounts
 import tests.system.base
 from mlrun import mlconf
+from mlrun_pipelines.common.models import RunStatuses
 
 
 @tests.system.base.TestMLRunSystem.skip_test_if_env_not_configured
@@ -36,7 +38,7 @@ class TestKFP(tests.system.base.TestMLRunSystem):
             project=self.project_name,
             image="mlrun/mlrun",
         )
-        kfp_with_v3io_mount.apply(mlrun.mount_v3io())
+        kfp_with_v3io_mount.apply(mlrun.runtimes.mounts.mount_v3io())
 
         @dsl.pipeline(name="job test", description="demonstrating mlrun usage")
         def job_pipeline(p1=9):
@@ -113,3 +115,63 @@ class TestKFP(tests.system.base.TestMLRunSystem):
         )
 
         mlrun.wait_for_pipeline_completion(run_id, project=self.project_name)
+
+    def test_kfp_retry(self):
+        code_path = str(self.assets_path / "my_func.py")
+        my_func = mlrun.code_to_function(
+            name="my-kfp-without-image",
+            kind="job",
+            filename=code_path,
+            project=self.project_name,
+        )
+
+        @dsl.pipeline(name="job no image test", description="kfp without image test")
+        def job_pipeline():
+            my_func.as_step(handler="handler", auto_build=True)
+
+        run_id = mlrun._run_pipeline(
+            job_pipeline,
+            experiment="my-job",
+            project=self.project_name,
+        )
+
+        mlrun.wait_for_pipeline_completion(run_id, project=self.project_name)
+        new_run_id = mlrun.retry_pipeline(run_id, project=self.project_name)
+        mlrun.wait_for_pipeline_completion(new_run_id, project=self.project_name)
+        assert (
+            new_run_id != run_id
+        )  # On successful runs, a new ID is generated because the pipeline is cloned
+
+    @pytest.mark.enterprise
+    def test_kfp_with_failed_pipeline(self):
+        code_path = str(self.assets_path / "raise_func.py")
+        func = mlrun.code_to_function(
+            name="func",
+            kind="job",
+            filename=code_path,
+            project=self.project_name,
+            image="mlrun/mlrun",
+        )
+        self.project.set_function(func)
+
+        @dsl.pipeline(name="job test", description="demonstrating mlrun usage")
+        def job_pipeline():
+            mlrun.run_function(
+                "func",
+                handler="handler",
+                outputs=["mymodel"],
+            )
+
+        run_id = self.project.run(
+            workflow_handler=job_pipeline,
+            name="my-job",
+        )
+
+        # double check that the pipeline completed successfully
+        mlrun.wait_for_pipeline_completion(
+            run_id, project=self.project_name, expected_statuses=[RunStatuses.failed]
+        )
+        db = mlrun.get_run_db()
+        run = db.get_pipeline(run_id, self.project_name)
+
+        assert run["run"].get("error") == "Error (exit code 1)"

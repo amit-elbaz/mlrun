@@ -15,6 +15,7 @@
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urlparse
 
 import oss2
@@ -22,13 +23,15 @@ from fsspec.registry import get_filesystem_class
 
 import mlrun.errors
 
-from .base import DataStore, FileStats, makeDatastoreSchemaSanitizer
+from .base import DataStore, FileStats, make_datastore_schema_sanitizer
 
 
 class OSSStore(DataStore):
     using_bucket = True
 
-    def __init__(self, parent, schema, name, endpoint="", secrets: dict = None):
+    def __init__(
+        self, parent, schema, name, endpoint="", secrets: Optional[dict] = None
+    ):
         super().__init__(parent, name, schema, endpoint, secrets)
         # will be used in case user asks to assume a role and work through fsspec
 
@@ -53,7 +56,7 @@ class OSSStore(DataStore):
         except ImportError as exc:
             raise ImportError("ALIBABA ossfs not installed") from exc
         filesystem_class = get_filesystem_class(protocol=self.kind)
-        self._filesystem = makeDatastoreSchemaSanitizer(
+        self._filesystem = make_datastore_schema_sanitizer(
             filesystem_class,
             using_bucket=self.using_bucket,
             **self.get_storage_options(),
@@ -85,6 +88,7 @@ class OSSStore(DataStore):
         return oss.get_object(key).read()
 
     def put(self, key, data, append=False):
+        data, _ = self._prepare_put_data(data, append)
         bucket, key = self.get_bucket_and_key(key)
         oss = oss2.Bucket(self.auth, self.endpoint_url, bucket)
         oss.put_object(key, data)

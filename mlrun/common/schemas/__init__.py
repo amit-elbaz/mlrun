@@ -11,10 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-# flake8: noqa  - this is until we take care of the F401 violations with respect to __all__ & sphinx
 
-from .alert import AlertActiveState, AlertConfig, Event
+from .alert import (
+    AlertActivation,
+    AlertActivations,
+    AlertActiveState,
+    AlertConfig,
+    AlertNotification,
+    AlertTemplate,
+    Event,
+)
 from .api_gateway import (
     APIGateway,
     APIGatewayAuthenticationMode,
@@ -31,7 +37,6 @@ from .artifact import (
     ArtifactCategories,
     ArtifactIdentifier,
     ArtifactMetadata,
-    ArtifactsFormat,
     ArtifactSpec,
 )
 from .auth import (
@@ -58,6 +63,7 @@ from .clusterization_spec import (
 from .common import ImageBuilder
 from .constants import (
     APIStates,
+    ArtifactPartitionByField,
     ClusterizationRole,
     DeletionStrategy,
     FeatureStorePartitionByField,
@@ -77,6 +83,7 @@ from .events import (
 )
 from .feature_store import (
     EntitiesOutput,
+    EntitiesOutputV2,
     Entity,
     EntityListOutput,
     EntityRecord,
@@ -85,7 +92,9 @@ from .feature_store import (
     FeatureRecord,
     FeatureSet,
     FeatureSetDigestOutput,
+    FeatureSetDigestOutputV2,
     FeatureSetDigestSpec,
+    FeatureSetDigestSpecV2,
     FeatureSetIngestInput,
     FeatureSetIngestOutput,
     FeatureSetRecord,
@@ -93,12 +102,14 @@ from .feature_store import (
     FeatureSetSpec,
     FeatureSetsTagsOutput,
     FeaturesOutput,
+    FeaturesOutputV2,
     FeatureVector,
     FeatureVectorRecord,
     FeatureVectorsOutput,
     FeatureVectorsTagsOutput,
 )
 from .frontend_spec import (
+    ArtifactLimits,
     AuthenticationFeatureFlag,
     FeatureFlags,
     FrontendSpec,
@@ -142,29 +153,33 @@ from .model_monitoring import (
     ModelMonitoringMode,
     ModelMonitoringStoreKinds,
     MonitoringFunctionNames,
-    PrometheusEndpoints,
-    TimeSeriesTarget,
+    TSDBTarget,
+    V3IOTSDBTables,
 )
 from .notification import (
     Notification,
     NotificationKind,
     NotificationSeverity,
+    NotificationState,
     NotificationStatus,
+    NotificationSummary,
     SetNotificationRequest,
 )
 from .object import ObjectKind, ObjectMetadata, ObjectSpec, ObjectStatus
 from .pagination import PaginationInfo
-from .pipeline import PipelinesFormat, PipelinesOutput, PipelinesPagination
+from .partition import PartitionInterval
+from .pipeline import PipelinesOutput, PipelinesPagination
 from .project import (
     IguazioProject,
     Project,
     ProjectDesiredState,
     ProjectMetadata,
+    ProjectOut,
     ProjectOutput,
     ProjectOwner,
-    ProjectsFormat,
     ProjectsOutput,
     ProjectSpec,
+    ProjectSpecOut,
     ProjectState,
     ProjectStatus,
     ProjectSummariesOutput,

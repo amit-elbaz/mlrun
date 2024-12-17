@@ -14,7 +14,7 @@
 #
 import typing
 
-import pydantic
+import pydantic.v1
 
 import mlrun.common.types
 
@@ -45,6 +45,9 @@ class FunctionState:
     # same goes for the build which is not coming from the pod, but is used and we can't just omit it for BC reasons
     build = "build"
 
+    # for pipeline steps
+    skipped = "skipped"
+
     @classmethod
     def get_function_state_from_pod_state(cls, pod_state: str):
         if pod_state == "succeeded":
@@ -60,6 +63,7 @@ class FunctionState:
         return [
             cls.ready,
             cls.error,
+            cls.skipped,
         ]
 
 
@@ -86,35 +90,42 @@ class SecurityContextEnrichmentModes(mlrun.common.types.StrEnum):
     disabled = "disabled"
 
 
-class ImagePullSecret(pydantic.BaseModel):
+class ImagePullSecret(pydantic.v1.BaseModel):
     default: typing.Optional[str]
 
 
-class Pipelines(pydantic.BaseModel):
+class Pipelines(pydantic.v1.BaseModel):
     kfp_pod_user_unix_id: typing.Optional[int]
 
 
-class SecurityContext(pydantic.BaseModel):
+class SecurityContext(pydantic.v1.BaseModel):
     default: typing.Optional[str]
     enrichment_mode: typing.Optional[SecurityContextEnrichmentModes]
     enrichment_group_id: typing.Optional[int]
     pipelines: typing.Optional[Pipelines]
 
 
-class ServiceAccount(pydantic.BaseModel):
+class ServiceAccount(pydantic.v1.BaseModel):
     default: typing.Optional[str]
 
 
-class StateThresholds(pydantic.BaseModel):
+class StateThresholds(pydantic.v1.BaseModel):
     default: typing.Optional[dict[str, str]]
 
 
-class FunctionSpec(pydantic.BaseModel):
+class FunctionSpec(pydantic.v1.BaseModel):
     image_pull_secret: typing.Optional[ImagePullSecret]
     security_context: typing.Optional[SecurityContext]
     service_account: typing.Optional[ServiceAccount]
     state_thresholds: typing.Optional[StateThresholds]
 
+    class Config:
+        extra = pydantic.v1.Extra.allow
 
-class Function(pydantic.BaseModel):
+
+class Function(pydantic.v1.BaseModel):
     spec: typing.Optional[FunctionSpec]
+    application: typing.Optional[dict[str, typing.Any]]
+
+    class Config:
+        extra = pydantic.v1.Extra.allow

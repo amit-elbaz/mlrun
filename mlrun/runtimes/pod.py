@@ -17,13 +17,16 @@ import os
 import re
 import time
 import typing
+from collections.abc import Iterable
 from enum import Enum
 
 import dotenv
-import kfp.dsl
 import kubernetes.client as k8s_client
+from kubernetes.client import V1Volume, V1VolumeMount
 
+import mlrun.common.constants
 import mlrun.errors
+import mlrun.runtimes.mounts
 import mlrun.utils.regex
 from mlrun.common.schemas import (
     NodeSelectorOperator,
@@ -37,11 +40,11 @@ from ..k8s_utils import (
     generate_preemptible_nodes_affinity_terms,
     generate_preemptible_nodes_anti_affinity_terms,
     generate_preemptible_tolerations,
+    validate_node_selectors,
 )
 from ..utils import logger, update_in
 from .base import BaseRuntime, FunctionSpec, spec_fields
 from .utils import (
-    apply_kfp,
     get_gpu_from_resource_requirement,
     get_item_name,
     set_named_item,
@@ -215,9 +218,7 @@ class KubeResourceSpec(FunctionSpec):
             image_pull_secret or mlrun.mlconf.function.spec.image_pull_secret.default
         )
         self.node_name = node_name
-        self.node_selector = (
-            node_selector or mlrun.mlconf.get_default_function_node_selector()
-        )
+        self.node_selector = node_selector or {}
         self._affinity = affinity
         self.priority_class_name = (
             priority_class_name or mlrun.mlconf.default_function_priority_class_name
@@ -310,7 +311,7 @@ class KubeResourceSpec(FunctionSpec):
         return self._termination_grace_period_seconds
 
     def _serialize_field(
-        self, struct: dict, field_name: str = None, strip: bool = False
+        self, struct: dict, field_name: typing.Optional[str] = None, strip: bool = False
     ) -> typing.Any:
         """
         Serialize a field to a dict, list, or primitive type.
@@ -322,7 +323,7 @@ class KubeResourceSpec(FunctionSpec):
         return super()._serialize_field(struct, field_name, strip)
 
     def _enrich_field(
-        self, struct: dict, field_name: str = None, strip: bool = False
+        self, struct: dict, field_name: typing.Optional[str] = None, strip: bool = False
     ) -> typing.Any:
         k8s_api = k8s_client.ApiClient()
         if strip:
@@ -367,6 +368,35 @@ class KubeResourceSpec(FunctionSpec):
                 + f"service accounts {allowed_service_accounts}"
             )
 
+    def with_volumes(
+        self,
+        volumes: typing.Union[list[dict], dict, V1Volume],
+    ) -> "KubeResourceSpec":
+        """Add volumes to the volumes dictionary, only used as part of the mlrun_pipelines mount functions."""
+        if isinstance(volumes, dict):
+            set_named_item(self._volumes, volumes)
+        elif isinstance(volumes, Iterable):
+            for volume in volumes:
+                set_named_item(self._volumes, volume)
+        else:
+            set_named_item(self._volumes, volumes)
+        return self
+
+    def with_volume_mounts(
+        self,
+        volume_mounts: typing.Union[list[dict], dict, V1VolumeMount],
+    ) -> "KubeResourceSpec":
+        """Add volume mounts to the volume mounts dictionary,
+        only used as part of the mlrun_pipelines mount functions."""
+        if isinstance(volume_mounts, dict):
+            self._set_volume_mount(volume_mounts)
+        elif isinstance(volume_mounts, Iterable):
+            for volume_mount in volume_mounts:
+                self._set_volume_mount(volume_mount)
+        else:
+            self._set_volume_mount(volume_mounts)
+        return self
+
     def _set_volume_mount(
         self, volume_mount, volume_mounts_field_name="_volume_mounts"
     ):
@@ -381,9 +411,9 @@ class KubeResourceSpec(FunctionSpec):
     def _verify_and_set_limits(
         self,
         resources_field_name,
-        mem: str = None,
-        cpu: str = None,
-        gpus: int = None,
+        mem: typing.Optional[str] = None,
+        cpu: typing.Optional[str] = None,
+        gpus: typing.Optional[int] = None,
         gpu_type: str = "nvidia.com/gpu",
         patch: bool = False,
     ):
@@ -431,8 +461,8 @@ class KubeResourceSpec(FunctionSpec):
     def _verify_and_set_requests(
         self,
         resources_field_name,
-        mem: str = None,
-        cpu: str = None,
+        mem: typing.Optional[str] = None,
+        cpu: typing.Optional[str] = None,
         patch: bool = False,
     ):
         resources = verify_requests(resources_field_name, mem=mem, cpu=cpu)
@@ -457,9 +487,9 @@ class KubeResourceSpec(FunctionSpec):
 
     def with_limits(
         self,
-        mem: str = None,
-        cpu: str = None,
-        gpus: int = None,
+        mem: typing.Optional[str] = None,
+        cpu: typing.Optional[str] = None,
+        gpus: typing.Optional[int] = None,
         gpu_type: str = "nvidia.com/gpu",
         patch: bool = False,
     ):
@@ -475,7 +505,12 @@ class KubeResourceSpec(FunctionSpec):
         """
         self._verify_and_set_limits("resources", mem, cpu, gpus, gpu_type, patch=patch)
 
-    def with_requests(self, mem: str = None, cpu: str = None, patch: bool = False):
+    def with_requests(
+        self,
+        mem: typing.Optional[str] = None,
+        cpu: typing.Optional[str] = None,
+        patch: bool = False,
+    ):
         """
         Set requested (desired) pod cpu/memory resources
 
@@ -532,7 +567,9 @@ class KubeResourceSpec(FunctionSpec):
             return
 
         # merge node selectors - precedence to existing node selector
-        self.node_selector = {**node_selector, **self.node_selector}
+        self.node_selector = mlrun.utils.helpers.merge_dicts_with_precedence(
+            node_selector, self.node_selector
+        )
 
     def _merge_tolerations(
         self,
@@ -935,12 +972,12 @@ class AutoMountType(str, Enum):
     @classmethod
     def all_mount_modifiers(cls):
         return [
-            mlrun.v3io_cred.__name__,
-            mlrun.mount_v3io.__name__,
-            mlrun.platforms.other.mount_pvc.__name__,
-            mlrun.auto_mount.__name__,
-            mlrun.platforms.mount_s3.__name__,
-            mlrun.platforms.set_env_variables.__name__,
+            mlrun.runtimes.mounts.v3io_cred.__name__,
+            mlrun.runtimes.mounts.mount_v3io.__name__,
+            mlrun.runtimes.mounts.mount_pvc.__name__,
+            mlrun.runtimes.mounts.auto_mount.__name__,
+            mlrun.runtimes.mounts.mount_s3.__name__,
+            mlrun.runtimes.mounts.set_env_variables.__name__,
         ]
 
     @classmethod
@@ -957,23 +994,23 @@ class AutoMountType(str, Enum):
     def _get_auto_modifier():
         # If we're running on Iguazio - use v3io_cred
         if mlconf.igz_version != "":
-            return mlrun.v3io_cred
+            return mlrun.runtimes.mounts.v3io_cred
         # Else, either pvc mount if it's configured or do nothing otherwise
         pvc_configured = (
             "MLRUN_PVC_MOUNT" in os.environ
             or "pvc_name" in mlconf.get_storage_auto_mount_params()
         )
-        return mlrun.platforms.other.mount_pvc if pvc_configured else None
+        return mlrun.runtimes.mounts.mount_pvc if pvc_configured else None
 
     def get_modifier(self):
         return {
             AutoMountType.none: None,
-            AutoMountType.v3io_credentials: mlrun.v3io_cred,
-            AutoMountType.v3io_fuse: mlrun.mount_v3io,
-            AutoMountType.pvc: mlrun.platforms.other.mount_pvc,
+            AutoMountType.v3io_credentials: mlrun.runtimes.mounts.v3io_cred,
+            AutoMountType.v3io_fuse: mlrun.runtimes.mounts.mount_v3io,
+            AutoMountType.pvc: mlrun.runtimes.mounts.mount_pvc,
             AutoMountType.auto: self._get_auto_modifier(),
-            AutoMountType.s3: mlrun.platforms.mount_s3,
-            AutoMountType.env: mlrun.platforms.set_env_variables,
+            AutoMountType.s3: mlrun.runtimes.mounts.mount_s3,
+            AutoMountType.env: mlrun.runtimes.mounts.set_env_variables,
         }[self]
 
 
@@ -997,26 +1034,6 @@ class KubeResource(BaseRuntime):
     def spec(self, spec):
         self._spec = self._verify_dict(spec, "spec", KubeResourceSpec)
 
-    def apply(self, modify):
-        """
-        Apply a modifier to the runtime which is used to change the runtimes k8s object's spec.
-        Modifiers can be either KFP modifiers or MLRun modifiers (which are compatible with KFP). All modifiers accept
-        a `kfp.dsl.ContainerOp` object, apply some changes on its spec and return it so modifiers can be chained
-        one after the other.
-
-        :param modify: a modifier runnable object
-        :return: the runtime (self) after the modifications
-        """
-
-        # Kubeflow pipeline have a hook to add the component to the DAG on ContainerOp init
-        # we remove the hook to suppress kubeflow op registration and return it after the apply()
-        old_op_handler = kfp.dsl._container_op._register_op_handler
-        kfp.dsl._container_op._register_op_handler = lambda x: self.metadata.name
-        cop = kfp.dsl.ContainerOp("name", "image")
-        kfp.dsl._container_op._register_op_handler = old_op_handler
-
-        return apply_kfp(modify, cop, self)
-
     def set_env_from_secret(self, name, secret=None, secret_key=None):
         """set pod environment var from secret"""
         secret_key = secret_key or name
@@ -1039,7 +1056,8 @@ class KubeResource(BaseRuntime):
 
     def get_env(self, name, default=None):
         """Get the pod environment variable for the given name, if not found return the default
-        If it's a scalar value, will return it, if the value is from source, return the k8s struct (V1EnvVarSource)"""
+        If it's a scalar value, will return it, if the value is from source, return the k8s struct (V1EnvVarSource)
+        """
         for env_var in self.spec.env:
             if get_item_name(env_var) == name:
                 # valueFrom is a workaround for now, for some reason the envs aren't getting sanitized
@@ -1058,44 +1076,22 @@ class KubeResource(BaseRuntime):
                 return True
         return False
 
-    def enrich_runtime_spec(
-        self,
-        project_node_selector: dict[str, str],
-    ):
-        """
-        Enriches the runtime spec with the project-level node selector.
-
-        This method merges the project-level node selector with the existing function node_selector.
-        The merge logic used here combines the two dictionaries, giving precedence to
-        the keys in the runtime node_selector. If there are conflicting keys between the
-        two dictionaries, the values from self.spec.node_selector will overwrite the
-        values from project_node_selector.
-
-        Example:
-        Suppose self.spec.node_selector = {"type": "gpu", "zone": "us-east-1"}
-        and project_node_selector = {"type": "cpu", "environment": "production"}.
-        After the merge, the resulting node_selector will be:
-        {"type": "gpu", "zone": "us-east-1", "environment": "production"}
-
-        Note:
-        - The merge uses the ** operator, also known as the "unpacking" operator in Python,
-          combining key-value pairs from each dictionary. Later dictionaries take precedence
-          when there are conflicting keys.
-        """
-        self.spec.node_selector = {**project_node_selector, **self.spec.node_selector}
-
     def _set_env(self, name, value=None, value_from=None):
         new_var = k8s_client.V1EnvVar(name=name, value=value, value_from=value_from)
-        i = 0
-        for v in self.spec.env:
-            if get_item_name(v) == name:
-                self.spec.env[i] = new_var
+
+        # ensure we don't have duplicate env vars with the same name
+        for env_index, value_item in enumerate(self.spec.env):
+            if get_item_name(value_item) == name:
+                self.spec.env[env_index] = new_var
                 return self
-            i += 1
         self.spec.env.append(new_var)
         return self
 
-    def set_envs(self, env_vars: dict = None, file_path: str = None):
+    def set_envs(
+        self,
+        env_vars: typing.Optional[dict] = None,
+        file_path: typing.Optional[str] = None,
+    ):
         """set pod environment var from key/value dict or .env file
 
         :param env_vars:  dict with env key/values
@@ -1115,11 +1111,16 @@ class KubeResource(BaseRuntime):
             else:
                 raise mlrun.errors.MLRunNotFoundError(f"{file_path} does not exist")
         for name, value in env_vars.items():
-            self.set_env(name, value)
+            if isinstance(value, dict) and "valueFrom" in value:
+                self.set_env(name, value_from=value["valueFrom"])
+            else:
+                self.set_env(name, value)
         return self
 
     def set_image_pull_configuration(
-        self, image_pull_policy: str = None, image_pull_secret_name: str = None
+        self,
+        image_pull_policy: typing.Optional[str] = None,
+        image_pull_secret_name: typing.Optional[str] = None,
     ):
         """
         Configure the image pull parameters for the runtime.
@@ -1152,12 +1153,12 @@ class KubeResource(BaseRuntime):
 
         :param state_thresholds: A dictionary of state to threshold. The supported states are:
 
-            * pending_scheduled - The pod/crd is scheduled on a node but not yet running
-            * pending_not_scheduled - The pod/crd is not yet scheduled on a node
-            * executing - The pod/crd started and is running
-            * image_pull_backoff - The pod/crd is in image pull backoff
-            See mlrun.mlconf.function.spec.state_thresholds for the default thresholds.
+                                 * pending_scheduled - The pod/crd is scheduled on a node but not yet running
+                                 * pending_not_scheduled - The pod/crd is not yet scheduled on a node
+                                 * executing - The pod/crd started and is running
+                                 * image_pull_backoff - The pod/crd is in image pull backoff
 
+                                See :code:`mlrun.mlconf.function.spec.state_thresholds` for the default thresholds.
         :param patch: Whether to merge the given thresholds with the existing thresholds (True, default)
                       or override them (False)
         """
@@ -1168,9 +1169,9 @@ class KubeResource(BaseRuntime):
 
     def with_limits(
         self,
-        mem: str = None,
-        cpu: str = None,
-        gpus: int = None,
+        mem: typing.Optional[str] = None,
+        cpu: typing.Optional[str] = None,
+        gpus: typing.Optional[int] = None,
         gpu_type: str = "nvidia.com/gpu",
         patch: bool = False,
     ):
@@ -1186,7 +1187,12 @@ class KubeResource(BaseRuntime):
         """
         self.spec.with_limits(mem, cpu, gpus, gpu_type, patch=patch)
 
-    def with_requests(self, mem: str = None, cpu: str = None, patch: bool = False):
+    def with_requests(
+        self,
+        mem: typing.Optional[str] = None,
+        cpu: typing.Optional[str] = None,
+        patch: bool = False,
+    ):
         """
         Set requested (desired) pod cpu/memory resources
 
@@ -1220,9 +1226,10 @@ class KubeResource(BaseRuntime):
         """
         if node_name:
             self.spec.node_name = node_name
-        if node_selector:
+        if node_selector is not None:
+            validate_node_selectors(node_selectors=node_selector, raise_on_error=False)
             self.spec.node_selector = node_selector
-        if affinity:
+        if affinity is not None:
             self.spec.affinity = affinity
         if tolerations is not None:
             self.spec.tolerations = tolerations
@@ -1296,6 +1303,36 @@ class KubeResource(BaseRuntime):
                 "Security context is handled internally when enrichment mode is not disabled"
             )
         self.spec.security_context = security_context
+
+    def apply(
+        self,
+        modifier: typing.Callable[["KubeResource"], "KubeResource"],
+    ) -> "KubeResource":
+        """
+        Apply a modifier to the runtime which is used to change the runtimes k8s object's spec.
+        All modifiers accept Kube, apply some changes on its spec and return it so modifiers can be chained
+        one after the other.
+
+        :param modifier: a modifier callable object
+        :return: the runtime (self) after the modifications
+        """
+        modifier(self)
+        if AutoMountType.is_auto_modifier(modifier):
+            self.spec.disable_auto_mount = True
+
+        api_client = k8s_client.ApiClient()
+        if self.spec.env:
+            for index, env in enumerate(
+                api_client.sanitize_for_serialization(self.spec.env)
+            ):
+                self.spec.env[index] = env
+
+        if self.spec.volumes and self.spec.volume_mounts:
+            vols = api_client.sanitize_for_serialization(self.spec.volumes)
+            mounts = api_client.sanitize_for_serialization(self.spec.volume_mounts)
+            self.spec.update_vols_and_mounts(vols, mounts)
+
+        return self
 
     def list_valid_priority_class_names(self):
         return mlconf.get_valid_function_priority_class_names()
@@ -1391,19 +1428,25 @@ class KubeResource(BaseRuntime):
 
     def _build_image(
         self,
-        builder_env,
-        force_build,
-        mlrun_version_specifier,
-        show_on_failure,
-        skip_deployed,
-        watch,
-        is_kfp,
-        with_mlrun,
+        builder_env: dict,
+        force_build: bool,
+        mlrun_version_specifier: typing.Optional[bool],
+        show_on_failure: bool,
+        skip_deployed: bool,
+        watch: bool,
+        is_kfp: bool,
+        with_mlrun: typing.Optional[bool],
     ):
         # When we're in pipelines context we must watch otherwise the pipelines pod will exit before the operation
         # is actually done. (when a pipelines pod exits, the pipeline step marked as done)
         if is_kfp:
             watch = True
+
+        if skip_deployed and self.requires_build() and not self.is_deployed():
+            logger.warning(
+                f"Even though {skip_deployed=}, the build might be triggered due to the function's configuration. "
+                "See requires_build() and is_deployed() for reasoning."
+            )
 
         db = self._get_db()
         data = db.remote_builder(
@@ -1450,20 +1493,32 @@ class KubeResource(BaseRuntime):
     ):
         db = self._get_db()
         offset = 0
+        events_offset = 0
         try:
-            text, _ = db.get_builder_status(self, 0, logs=logs)
+            text, _, deploy_status_text_kind = db.get_builder_status(
+                self,
+                offset=0,
+                logs=logs,
+                events_offset=0,
+            )
         except mlrun.db.RunDBError:
-            raise ValueError("function or build process not found")
+            raise ValueError("Function or build process not found")
 
-        def print_log(text):
-            if text and (
+        def print_log(_text):
+            if _text and (
                 not show_on_failure
                 or self.status.state == mlrun.common.schemas.FunctionState.error
             ):
-                print(text, end="")
+                print(_text, end="")
 
         print_log(text)
-        offset += len(text)
+        if (
+            deploy_status_text_kind
+            == mlrun.common.constants.DeployStatusTextKind.events
+        ):
+            events_offset += len(text)
+        else:
+            offset += len(text)
         if watch:
             while self.status.state in [
                 mlrun.common.schemas.FunctionState.pending,
@@ -1472,14 +1527,30 @@ class KubeResource(BaseRuntime):
                 time.sleep(2)
                 if show_on_failure:
                     text = ""
-                    db.get_builder_status(self, 0, logs=False)
+                    db.get_builder_status(self, offset=0, logs=False, events_offset=0)
                     if self.status.state == mlrun.common.schemas.FunctionState.error:
                         # re-read the full log on failure
-                        text, _ = db.get_builder_status(self, offset, logs=logs)
+                        text, _, deploy_status_text_kind = db.get_builder_status(
+                            self,
+                            offset=offset,
+                            logs=logs,
+                            events_offset=events_offset,
+                        )
                 else:
-                    text, _ = db.get_builder_status(self, offset, logs=logs)
+                    text, _, deploy_status_text_kind = db.get_builder_status(
+                        self,
+                        offset=offset,
+                        logs=logs,
+                        events_offset=events_offset,
+                    )
                 print_log(text)
-                offset += len(text)
+                if (
+                    deploy_status_text_kind
+                    == mlrun.common.constants.DeployStatusTextKind.events
+                ):
+                    events_offset += len(text)
+                else:
+                    offset += len(text)
 
         return self.status.state
 
@@ -1562,7 +1633,7 @@ def get_sanitized_attribute(spec, attribute_name: str):
 
     # check if attribute of type dict, and then check if type is sanitized
     if isinstance(attribute, dict):
-        if attribute_config["not_sanitized_class"] != dict:
+        if not isinstance(attribute_config["not_sanitized_class"], dict):
             raise mlrun.errors.MLRunInvalidArgumentTypeError(
                 f"expected to be of type {attribute_config.get('not_sanitized_class')} but got dict"
             )
@@ -1572,7 +1643,7 @@ def get_sanitized_attribute(spec, attribute_name: str):
     elif isinstance(attribute, list) and not isinstance(
         attribute[0], attribute_config["sub_attribute_type"]
     ):
-        if attribute_config["not_sanitized_class"] != list:
+        if not isinstance(attribute_config["not_sanitized_class"], list):
             raise mlrun.errors.MLRunInvalidArgumentTypeError(
                 f"expected to be of type {attribute_config.get('not_sanitized_class')} but got list"
             )

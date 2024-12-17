@@ -21,11 +21,11 @@ from typing import Any, Callable, Optional, Union
 import mlrun.common.schemas
 import mlrun.config
 import mlrun.errors
-import mlrun.kfpops
 import mlrun.lists
 import mlrun.model
 import mlrun.runtimes
 import mlrun.utils.regex
+import mlrun_pipelines.common.ops
 from mlrun.utils import logger
 
 run_modes = ["pass"]
@@ -61,7 +61,7 @@ class BaseLauncher(abc.ABC):
         schedule: Optional[
             Union[str, mlrun.common.schemas.schedule.ScheduleCronTrigger]
         ] = None,
-        hyperparams: dict[str, list] = None,
+        hyperparams: Optional[dict[str, list]] = None,
         hyper_param_options: Optional[mlrun.model.HyperParamOptions] = None,
         verbose: Optional[bool] = None,
         scrape_metrics: Optional[bool] = None,
@@ -237,7 +237,7 @@ class BaseLauncher(abc.ABC):
         out_path=None,
         artifact_path=None,
         workdir=None,
-        notifications: list[mlrun.model.Notification] = None,
+        notifications: Optional[list[mlrun.model.Notification]] = None,
         state_thresholds: Optional[dict[str, int]] = None,
     ):
         run.spec.handler = (
@@ -390,7 +390,7 @@ class BaseLauncher(abc.ABC):
             return
 
         if result and runtime.kfp and err is None:
-            mlrun.kfpops.write_kfpmeta(result)
+            mlrun_pipelines.common.ops.write_kfpmeta(result)
 
         self._log_track_results(runtime.is_child, result, run)
 
@@ -403,7 +403,7 @@ class BaseLauncher(abc.ABC):
             )
             if (
                 run.status.state
-                in mlrun.runtimes.constants.RunStates.error_and_abortion_states()
+                in mlrun.common.runtimes.constants.RunStates.error_and_abortion_states()
             ):
                 if runtime._is_remote and not runtime.is_child:
                     logger.error(

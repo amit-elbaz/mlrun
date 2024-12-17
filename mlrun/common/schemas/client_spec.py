@@ -14,13 +14,13 @@
 #
 import typing
 
-import pydantic
+import pydantic.v1
 
 from .function import Function
 from .k8s import Resources
 
 
-class ClientSpec(pydantic.BaseModel):
+class ClientSpec(pydantic.v1.BaseModel):
     version: typing.Optional[str]
     namespace: typing.Optional[str]
     docker_registry: typing.Optional[str]
@@ -57,8 +57,7 @@ class ClientSpec(pydantic.BaseModel):
     redis_url: typing.Optional[str]
     redis_type: typing.Optional[str]
     sql_url: typing.Optional[str]
-    model_endpoint_monitoring_store_type: typing.Optional[str]
-    model_endpoint_monitoring_endpoint_store_connection: typing.Optional[str]
+    model_monitoring_tsdb_connection: typing.Optional[str]
     ce: typing.Optional[dict]
     # not passing them as one object as it possible client user would like to override only one of the params
     calculate_artifact_hash: typing.Optional[str]

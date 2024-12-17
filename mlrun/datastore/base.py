@@ -24,13 +24,12 @@ import pandas as pd
 import pyarrow
 import pytz
 import requests
-import urllib3
 from deprecated import deprecated
 
 import mlrun.config
 import mlrun.errors
 from mlrun.errors import err_to_str
-from mlrun.utils import StorePrefix, is_ipython, logger
+from mlrun.utils import StorePrefix, is_jupyter, logger
 
 from .store_resources import is_store_uri, parse_store_uri
 from .utils import filter_df_start_end_time, select_columns_from_df
@@ -49,7 +48,7 @@ class FileStats:
 class DataStore:
     using_bucket = False
 
-    def __init__(self, parent, name, kind, endpoint="", secrets: dict = None):
+    def __init__(self, parent, name, kind, endpoint="", secrets: Optional[dict] = None):
         self._parent = parent
         self.kind = kind
         self.name = name
@@ -157,6 +156,18 @@ class DataStore:
     def put(self, key, data, append=False):
         pass
 
+    def _prepare_put_data(self, data, append=False):
+        mode = "a" if append else "w"
+        if isinstance(data, bytearray):
+            data = bytes(data)
+
+        if isinstance(data, bytes):
+            return data, f"{mode}b"
+        elif isinstance(data, str):
+            return data, mode
+        else:
+            raise TypeError(f"Unable to put a value of type {type(self).__name__}")
+
     def stat(self, key):
         pass
 
@@ -179,11 +190,23 @@ class DataStore:
         return {}
 
     @staticmethod
-    def _parquet_reader(df_module, url, file_system, time_column, start_time, end_time):
+    def _parquet_reader(
+        df_module,
+        url,
+        file_system,
+        time_column,
+        start_time,
+        end_time,
+        additional_filters,
+    ):
         from storey.utils import find_filters, find_partitions
 
         def set_filters(
-            partitions_time_attributes, start_time_inner, end_time_inner, kwargs
+            partitions_time_attributes,
+            start_time_inner,
+            end_time_inner,
+            filters_inner,
+            kwargs,
         ):
             filters = []
             find_filters(
@@ -193,20 +216,32 @@ class DataStore:
                 filters,
                 time_column,
             )
+            if filters and filters_inner:
+                filters[0] += filters_inner
+
             kwargs["filters"] = filters
 
         def reader(*args, **kwargs):
-            if start_time or end_time:
-                if time_column is None:
-                    raise mlrun.errors.MLRunInvalidArgumentError(
-                        "When providing start_time or end_time, must provide time_column"
-                    )
+            if time_column is None and (start_time or end_time):
+                raise mlrun.errors.MLRunInvalidArgumentError(
+                    "When providing start_time or end_time, must provide time_column"
+                )
+            if (
+                start_time
+                and end_time
+                and start_time.utcoffset() != end_time.utcoffset()
+            ):
+                raise mlrun.errors.MLRunInvalidArgumentError(
+                    "start_time and end_time must have the same time zone"
+                )
 
+            if start_time or end_time or additional_filters:
                 partitions_time_attributes = find_partitions(url, file_system)
                 set_filters(
                     partitions_time_attributes,
                     start_time,
                     end_time,
+                    additional_filters,
                     kwargs,
                 )
                 try:
@@ -217,17 +252,23 @@ class DataStore:
                     ):
                         raise ex
 
-                    if start_time.tzinfo:
-                        start_time_inner = start_time.replace(tzinfo=None)
-                        end_time_inner = end_time.replace(tzinfo=None)
-                    else:
-                        start_time_inner = start_time.replace(tzinfo=pytz.utc)
-                        end_time_inner = end_time.replace(tzinfo=pytz.utc)
+                    start_time_inner = None
+                    if start_time:
+                        start_time_inner = start_time.replace(
+                            tzinfo=None if start_time.tzinfo else pytz.utc
+                        )
+
+                    end_time_inner = None
+                    if end_time:
+                        end_time_inner = end_time.replace(
+                            tzinfo=None if end_time.tzinfo else pytz.utc
+                        )
 
                     set_filters(
                         partitions_time_attributes,
                         start_time_inner,
                         end_time_inner,
+                        additional_filters,
                         kwargs,
                     )
                     return df_module.read_parquet(*args, **kwargs)
@@ -246,6 +287,7 @@ class DataStore:
         start_time=None,
         end_time=None,
         time_column=None,
+        additional_filters=None,
         **kwargs,
     ):
         df_module = df_module or pd
@@ -301,16 +343,18 @@ class DataStore:
                                 dfs.append(df_module.read_csv(*updated_args, **kwargs))
                         return df_module.concat(dfs)
 
-        elif (
-            file_url.endswith(".parquet")
-            or file_url.endswith(".pq")
-            or format == "parquet"
-        ):
+        elif mlrun.utils.helpers.is_parquet_file(file_url, format):
             if columns:
                 kwargs["columns"] = columns
 
             reader = self._parquet_reader(
-                df_module, url, file_system, time_column, start_time, end_time
+                df_module,
+                url,
+                file_system,
+                time_column,
+                start_time,
+                end_time,
+                additional_filters,
             )
 
         elif file_url.endswith(".json") or format == "json":
@@ -362,7 +406,10 @@ class DataStore:
         }
 
     def rm(self, path, recursive=False, maxdepth=None):
-        self.filesystem.rm(path=path, recursive=recursive, maxdepth=maxdepth)
+        try:
+            self.filesystem.rm(path=path, recursive=recursive, maxdepth=maxdepth)
+        except FileNotFoundError:
+            pass
 
     @staticmethod
     def _is_dd(df_module):
@@ -453,12 +500,18 @@ class DataItem:
         """DataItem url e.g. /dir/path, s3://bucket/path"""
         return self._url
 
-    def get(self, size=None, offset=0, encoding=None):
+    def get(
+        self,
+        size: Optional[int] = None,
+        offset: int = 0,
+        encoding: Optional[str] = None,
+    ) -> Union[bytes, str]:
         """read all or a byte range and return the content
 
         :param size:     number of bytes to get
         :param offset:   fetch from offset (in bytes)
         :param encoding: encoding (e.g. "utf-8") for converting bytes to str
+        :return:         the bytes/str content
         """
         body = self._store.get(self._path, size=size, offset=offset)
         if encoding and isinstance(body, bytes):
@@ -472,7 +525,7 @@ class DataItem:
         """
         self._store.download(self._path, target_path)
 
-    def put(self, data, append=False):
+    def put(self, data: Union[bytes, str], append: bool = False) -> None:
         """write/upload the data, append is only supported by some datastores
 
         :param data:   data (bytes/str) to write
@@ -539,6 +592,7 @@ class DataItem:
         time_column=None,
         start_time=None,
         end_time=None,
+        additional_filters=None,
         **kwargs,
     ):
         """return a dataframe object (generated from the dataitem).
@@ -550,6 +604,12 @@ class DataItem:
         :param end_time:    filters out data after this time
         :param time_column: Store timestamp_key will be used if None.
                             The results will be filtered by this column and start_time & end_time.
+        :param additional_filters: List of additional_filter conditions as tuples.
+                                    Each tuple should be in the format (column_name, operator, value).
+                                    Supported operators: "=", ">=", "<=", ">", "<".
+                                    Example: [("Product", "=", "Computer")]
+                                    For all supported filters, please see:
+                                    https://arrow.apache.org/docs/python/generated/pyarrow.parquet.ParquetDataset.html
         """
         df = self._store.as_df(
             self._url,
@@ -560,18 +620,19 @@ class DataItem:
             time_column=time_column,
             start_time=start_time,
             end_time=end_time,
+            additional_filters=additional_filters,
             **kwargs,
         )
         return df
 
-    def show(self, format=None):
+    def show(self, format: Optional[str] = None) -> None:
         """show the data object content in Jupyter
 
         :param format: format to use (when there is no/wrong suffix), e.g. 'png'
         """
-        if not is_ipython:
+        if not is_jupyter:
             logger.warning(
-                "Jupyter/IPython was not detected, .show() will only display inside Jupyter"
+                "Jupyter was not detected. `.show()` displays only inside Jupyter."
             )
             return
 
@@ -632,7 +693,9 @@ def basic_auth_header(user, password):
 
 
 class HttpStore(DataStore):
-    def __init__(self, parent, schema, name, endpoint="", secrets: dict = None):
+    def __init__(
+        self, parent, schema, name, endpoint="", secrets: Optional[dict] = None
+    ):
         super().__init__(parent, name, schema, endpoint, secrets)
         self._https_auth_token = None
         self._schema = schema
@@ -689,8 +752,6 @@ class HttpStore(DataStore):
 
         verify_ssl = mlconf.httpdb.http.verify
         try:
-            if not verify_ssl:
-                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
             response = requests.get(url, headers=headers, auth=auth, verify=verify_ssl)
         except OSError as exc:
             raise OSError(f"error: cannot connect to {url}: {err_to_str(exc)}")
@@ -704,7 +765,7 @@ class HttpStore(DataStore):
 # As an example, it converts an S3 URL 's3://s3bucket/path' to just 's3bucket/path'.
 # Since 'ds' schemas are not inherently processed by fsspec, we have adapted the _strip_protocol()
 # method specifically to strip away the 'ds' schema as required.
-def makeDatastoreSchemaSanitizer(cls, using_bucket=False, *args, **kwargs):
+def make_datastore_schema_sanitizer(cls, using_bucket=False, *args, **kwargs):
     if not issubclass(cls, fsspec.AbstractFileSystem):
         raise ValueError("Class must be a subclass of fsspec.AbstractFileSystem")
 

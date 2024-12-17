@@ -13,9 +13,10 @@
 # limitations under the License.
 #
 import os
+from typing import Optional
 
 
-def secret_test_function(context, secrets: list = None):
+def secret_test_function(context, secrets: Optional[list] = None):
     """Validate that given secrets exists
 
     :param context: the MLRun context
@@ -41,6 +42,17 @@ def log_artifact_test_function(context, body_size: int = 1000, inline: bool = Tr
     context.log_artifact("test", body=body, is_inline=inline)
     context.logger.info("run complete!", body_len=len(body))
     return True
+
+
+def log_artifact_many_tags(context):
+    body = b"abc123"
+    context.log_artifact("file_result", body=body, tag="v1")
+    context.log_artifact("file_result", body=body, tag="v2")
+    context.log_artifact("file_result", body=body, tag="v3")
+
+
+def log_artifact_with_tag(context, tag):
+    context.log_artifact("file_result", body=b"abc123", tag=tag)
 
 
 def access_key_verifier(context, v3io_access_key: str):

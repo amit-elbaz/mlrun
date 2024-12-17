@@ -39,7 +39,7 @@ from mlrun.serving.states import (
 )
 from mlrun.utils import get_caller_globals, logger, set_paths
 
-from .function import NuclioSpec, RemoteRuntime
+from .function import NuclioSpec, RemoteRuntime, min_nuclio_versions
 
 serving_subkind = "serving_v2"
 
@@ -51,7 +51,7 @@ if TYPE_CHECKING:
 def new_v2_model_server(
     name,
     model_class: str,
-    models: dict = None,
+    models: Optional[dict] = None,
     filename="",
     protocol="",
     image="",
@@ -312,26 +312,29 @@ class ServingRuntime(RemoteRuntime):
         sample: Optional[int] = None,
         stream_args: Optional[dict] = None,
         tracking_policy: Optional[Union["TrackingPolicy", dict]] = None,
+        enable_tracking: bool = True,
     ) -> None:
-        """apply on your serving function to monitor a deployed model, including real-time dashboards to detect drift
-           and analyze performance.
+        """Apply on your serving function to monitor a deployed model, including real-time dashboards to detect drift
+        and analyze performance.
 
-        :param stream_path:     Path/url of the tracking stream e.g. v3io:///users/mike/mystream
-                                you can use the "dummy://" path for test/simulation.
-        :param batch:           Micro batch size (send micro batches of N records at a time).
-        :param sample:          Sample size (send only one of N records).
-        :param stream_args:     Stream initialization parameters, e.g. shards, retention_in_hours, ..
+        :param stream_path:         Path/url of the tracking stream e.g. v3io:///users/mike/mystream
+                                    you can use the "dummy://" path for test/simulation.
+        :param batch:               Micro batch size (send micro batches of N records at a time).
+        :param sample:              Sample size (send only one of N records).
+        :param stream_args:         Stream initialization parameters, e.g. shards, retention_in_hours, ..
+        :param enable_tracking:     Enabled/Disable model-monitoring tracking.
+                                    Default True (tracking enabled).
 
-                                example::
+        Example::
 
-                                    # initialize a new serving function
-                                    serving_fn = mlrun.import_function("hub://v2-model-server", new_name="serving")
-                                    # apply model monitoring
-                                    serving_fn.set_tracking()
+            # initialize a new serving function
+            serving_fn = mlrun.import_function("hub://v2-model-server", new_name="serving")
+            # apply model monitoring
+            serving_fn.set_tracking()
 
         """
         # Applying model monitoring configurations
-        self.spec.track_models = True
+        self.spec.track_models = enable_tracking
 
         if stream_path:
             self.spec.parameters["log_stream"] = stream_path
@@ -353,12 +356,12 @@ class ServingRuntime(RemoteRuntime):
     def add_model(
         self,
         key: str,
-        model_path: str = None,
-        class_name: str = None,
-        model_url: str = None,
-        handler: str = None,
-        router_step: str = None,
-        child_function: str = None,
+        model_path: Optional[str] = None,
+        class_name: Optional[str] = None,
+        model_url: Optional[str] = None,
+        handler: Optional[str] = None,
+        router_step: Optional[str] = None,
+        child_function: Optional[str] = None,
         **class_args,
     ):
         """add ml model and/or route to the function.
@@ -418,8 +421,6 @@ class ServingRuntime(RemoteRuntime):
                 class_name.model_path = model_path
             key, state = params_to_step(class_name, key)
         else:
-            if not model_path and not model_url:
-                raise ValueError("model_path or model_url must be provided")
             class_name = class_name or self.spec.default_class
             if class_name and not isinstance(class_name, str):
                 raise ValueError(
@@ -477,7 +478,7 @@ class ServingRuntime(RemoteRuntime):
                 trigger_args = stream.trigger_args or {}
 
                 engine = self.spec.graph.engine or "async"
-                if mlrun.mlconf.is_explicit_ack() and engine == "async":
+                if mlrun.mlconf.is_explicit_ack_enabled() and engine == "async":
                     trigger_args["explicit_ack_mode"] = trigger_args.get(
                         "explicit_ack_mode", "explicitOnly"
                     )
@@ -506,7 +507,7 @@ class ServingRuntime(RemoteRuntime):
                         stream.path, group=group, shards=stream.shards, **trigger_args
                     )
 
-    def _deploy_function_refs(self, builder_env: dict = None):
+    def _deploy_function_refs(self, builder_env: Optional[dict] = None):
         """set metadata and deploy child functions"""
         for function_ref in self._spec.function_refs.values():
             logger.info(f"deploy child function {function_ref.name} ...")
@@ -574,13 +575,14 @@ class ServingRuntime(RemoteRuntime):
         self.spec.secret_sources.append({"kind": kind, "source": source})
         return self
 
+    @min_nuclio_versions("1.12.10")
     def deploy(
         self,
         project="",
         tag="",
         verbose=False,
         auth_info: mlrun.common.schemas.AuthInfo = None,
-        builder_env: dict = None,
+        builder_env: Optional[dict] = None,
         force_build: bool = False,
     ):
         """deploy model serving function to a local/remote cluster
@@ -604,7 +606,7 @@ class ServingRuntime(RemoteRuntime):
         ):
             # initialize or create required streams/queues
             self.spec.graph.check_and_process_graph()
-            self.spec.graph.init_queues()
+            self.spec.graph.create_queue_streams()
             functions_in_steps = self.spec.graph.list_child_functions()
             child_functions = list(self._spec.function_refs.keys())
             for function in functions_in_steps:
@@ -641,9 +643,12 @@ class ServingRuntime(RemoteRuntime):
 
     def _get_serving_spec(self):
         function_name_uri_map = {f.name: f.uri(self) for f in self.spec.function_refs}
-
         serving_spec = {
+            "function_name": self.metadata.name,
+            "function_tag": self.metadata.tag,
             "function_uri": self._function_uri(),
+            "function_hash": self.metadata.hash,
+            "project": self.metadata.project,
             "version": "v2",
             "parameters": self.spec.parameters,
             "graph": self.spec.graph.to_dict() if self.spec.graph else {},
@@ -673,7 +678,6 @@ class ServingRuntime(RemoteRuntime):
         """create mock server object for local testing/emulation
 
         :param namespace: one or list of namespaces/modules to search the steps classes/functions in
-        :param log_level: log level (error | info | debug)
         :param current_function: specify if you want to simulate a child function, * for all functions
         :param track_models: allow model tracking (disabled by default in the mock server)
         :param workdir:   working directory to locate the source code (if not the current one)
@@ -701,10 +705,13 @@ class ServingRuntime(RemoteRuntime):
             verbose=self.verbose,
             current_function=current_function,
             graph_initializer=self.spec.graph_initializer,
-            track_models=track_models and self.spec.track_models,
+            track_models=self.spec.track_models,
             function_uri=self._function_uri(),
             secret_sources=self.spec.secret_sources,
             default_content_type=self.spec.default_content_type,
+            function_name=self.metadata.name,
+            function_tag=self.metadata.tag,
+            project=self.metadata.project,
             **kwargs,
         )
         server.init_states(
@@ -712,6 +719,7 @@ class ServingRuntime(RemoteRuntime):
             namespace=namespace,
             logger=logger,
             is_mock=True,
+            monitoring_mock=track_models,
         )
 
         if workdir:

@@ -12,14 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-__all__ = ["TaskStep", "RouterStep", "RootFlowStep", "ErrorStep"]
+__all__ = [
+    "TaskStep",
+    "RouterStep",
+    "RootFlowStep",
+    "ErrorStep",
+    "MonitoringApplicationStep",
+]
 
 import os
 import pathlib
 import traceback
 from copy import copy, deepcopy
 from inspect import getfullargspec, signature
-from typing import Union
+from typing import Any, Optional, Union, cast
+
+import storey.utils
 
 import mlrun
 
@@ -55,6 +63,7 @@ class StepKinds:
     choice = "choice"
     root = "root"
     error_step = "error_step"
+    monitoring_application = "monitoring_application"
 
 
 _task_step_fields = [
@@ -75,6 +84,9 @@ _task_step_fields = [
 ]
 
 
+MAX_ALLOWED_STEPS = 4500
+
+
 def new_model_endpoint(class_name, model_path, handler=None, **class_args):
     class_args = deepcopy(class_args)
     class_args["model_path"] = model_path
@@ -92,7 +104,12 @@ class BaseStep(ModelObj):
     default_shape = "ellipse"
     _dict_fields = ["kind", "comment", "after", "on_error"]
 
-    def __init__(self, name: str = None, after: list = None, shape: str = None):
+    def __init__(
+        self,
+        name: Optional[str] = None,
+        after: Optional[list] = None,
+        shape: Optional[str] = None,
+    ):
         self.name = name
         self._parent = None
         self.comment = None
@@ -142,14 +159,14 @@ class BaseStep(ModelObj):
 
     def error_handler(
         self,
-        name: str = None,
+        name: Optional[str] = None,
         class_name=None,
         handler=None,
         before=None,
         function=None,
-        full_event: bool = None,
-        input_path: str = None,
-        result_path: str = None,
+        full_event: Optional[bool] = None,
+        input_path: Optional[str] = None,
+        result_path: Optional[str] = None,
         **class_args,
     ):
         """set error handler on a step or the entire graph (to be executed on failure/raise)
@@ -285,13 +302,13 @@ class BaseStep(ModelObj):
     def to(
         self,
         class_name: Union[str, StepToDict] = None,
-        name: str = None,
-        handler: str = None,
-        graph_shape: str = None,
-        function: str = None,
-        full_event: bool = None,
-        input_path: str = None,
-        result_path: str = None,
+        name: Optional[str] = None,
+        handler: Optional[str] = None,
+        graph_shape: Optional[str] = None,
+        function: Optional[str] = None,
+        full_event: Optional[bool] = None,
+        input_path: Optional[str] = None,
+        result_path: Optional[str] = None,
         **class_args,
     ):
         """add a step right after this step and return the new step
@@ -327,7 +344,7 @@ class BaseStep(ModelObj):
             parent = self._parent
         else:
             raise GraphError(
-                f"step {self.name} parent is not set or its not part of a graph"
+                f"step {self.name} parent is not set or it's not part of a graph"
             )
 
         name, step = params_to_step(
@@ -349,6 +366,39 @@ class BaseStep(ModelObj):
         parent._last_added = step
         return step
 
+    def set_flow(
+        self,
+        steps: list[Union[str, StepToDict, dict[str, Any]]],
+        force: bool = False,
+    ):
+        """set list of steps as downstream from this step, in the order specified. This will overwrite any existing
+        downstream steps.
+
+        :param steps: list of steps to follow this one
+        :param force: whether to overwrite existing downstream steps. If False, this method will fail if any downstream
+        steps have already been defined. Defaults to False.
+        :return: the last step added to the flow
+
+        example:
+            The below code sets the downstream nodes of step1 by using a list of steps (provided to `set_flow()`) and a
+            single step (provided to `to()`), resulting in the graph (step1 -> step2 -> step3 -> step4).
+            Notice that using `force=True` is required in case step1 already had downstream nodes (e.g. if the existing
+            graph is step1 -> step2_old) and that following the execution of this code the existing downstream steps
+            are removed. If the intention is to split the graph (and not to overwrite), please use `to()`.
+
+            step1.set_flow(
+                [
+                    dict(name="step2", handler="step2_handler"),
+                    dict(name="step3", class_name="Step3Class"),
+                ],
+                force=True,
+            ).to(dict(name="step4", class_name="Step4Class"))
+        """
+        raise NotImplementedError("set_flow() can only be called on a FlowStep")
+
+    def supports_termination(self):
+        return False
+
 
 class TaskStep(BaseStep):
     """task execution step, runs a class or handler"""
@@ -359,16 +409,16 @@ class TaskStep(BaseStep):
 
     def __init__(
         self,
-        class_name: Union[str, type] = None,
-        class_args: dict = None,
-        handler: str = None,
-        name: str = None,
-        after: list = None,
-        full_event: bool = None,
-        function: str = None,
-        responder: bool = None,
-        input_path: str = None,
-        result_path: str = None,
+        class_name: Optional[Union[str, type]] = None,
+        class_args: Optional[dict] = None,
+        handler: Optional[str] = None,
+        name: Optional[str] = None,
+        after: Optional[list] = None,
+        full_event: Optional[bool] = None,
+        function: Optional[str] = None,
+        responder: Optional[bool] = None,
+        input_path: Optional[str] = None,
+        result_path: Optional[str] = None,
     ):
         super().__init__(name, after)
         self.class_name = class_name
@@ -455,13 +505,15 @@ class TaskStep(BaseStep):
                 class_args[key] = arg
         class_args.update(extra_kwargs)
 
-        # add common args (name, context, ..) only if target class can accept them
-        argspec = getfullargspec(class_object)
-        for key in ["name", "context", "input_path", "result_path", "full_event"]:
-            if argspec.varkw or key in argspec.args:
-                class_args[key] = getattr(self, key)
-        if argspec.varkw or "graph_step" in argspec.args:
-            class_args["graph_step"] = self
+        if not isinstance(self, MonitoringApplicationStep):
+            # add common args (name, context, ..) only if target class can accept them
+            argspec = getfullargspec(class_object)
+
+            for key in ["name", "context", "input_path", "result_path", "full_event"]:
+                if argspec.varkw or key in argspec.args:
+                    class_args[key] = getattr(self, key)
+            if argspec.varkw or "graph_step" in argspec.args:
+                class_args["graph_step"] = self
         return class_args
 
     def get_step_class_object(self, namespace):
@@ -505,6 +557,8 @@ class TaskStep(BaseStep):
             self._object.post_init(mode)
             if hasattr(self._object, "model_endpoint_uid"):
                 self.endpoint_uid = self._object.model_endpoint_uid
+            if hasattr(self._object, "name"):
+                self.endpoint_name = self._object.name
 
     def respond(self):
         """mark this step as the responder.
@@ -552,6 +606,39 @@ class TaskStep(BaseStep):
         return event
 
 
+class MonitoringApplicationStep(TaskStep):
+    """monitoring application execution step, runs users class code"""
+
+    kind = "monitoring_application"
+    _default_class = ""
+
+    def __init__(
+        self,
+        class_name: Optional[Union[str, type]] = None,
+        class_args: Optional[dict] = None,
+        handler: Optional[str] = None,
+        name: Optional[str] = None,
+        after: Optional[list] = None,
+        full_event: Optional[bool] = None,
+        function: Optional[str] = None,
+        responder: Optional[bool] = None,
+        input_path: Optional[str] = None,
+        result_path: Optional[str] = None,
+    ):
+        super().__init__(
+            class_name=class_name,
+            class_args=class_args,
+            handler=handler,
+            name=name,
+            after=after,
+            full_event=full_event,
+            function=function,
+            responder=responder,
+            input_path=input_path,
+            result_path=result_path,
+        )
+
+
 class ErrorStep(TaskStep):
     """error execution step, runs a class or handler"""
 
@@ -561,16 +648,16 @@ class ErrorStep(TaskStep):
 
     def __init__(
         self,
-        class_name: Union[str, type] = None,
-        class_args: dict = None,
-        handler: str = None,
-        name: str = None,
-        after: list = None,
-        full_event: bool = None,
-        function: str = None,
-        responder: bool = None,
-        input_path: str = None,
-        result_path: str = None,
+        class_name: Optional[Union[str, type]] = None,
+        class_args: Optional[dict] = None,
+        handler: Optional[str] = None,
+        name: Optional[str] = None,
+        after: Optional[list] = None,
+        full_event: Optional[bool] = None,
+        function: Optional[str] = None,
+        responder: Optional[bool] = None,
+        input_path: Optional[str] = None,
+        result_path: Optional[str] = None,
     ):
         super().__init__(
             class_name=class_name,
@@ -598,14 +685,14 @@ class RouterStep(TaskStep):
 
     def __init__(
         self,
-        class_name: Union[str, type] = None,
-        class_args: dict = None,
-        handler: str = None,
-        routes: list = None,
-        name: str = None,
-        function: str = None,
-        input_path: str = None,
-        result_path: str = None,
+        class_name: Optional[Union[str, type]] = None,
+        class_args: Optional[dict] = None,
+        handler: Optional[str] = None,
+        routes: Optional[list] = None,
+        name: Optional[str] = None,
+        function: Optional[str] = None,
+        input_path: Optional[str] = None,
+        result_path: Optional[str] = None,
     ):
         super().__init__(
             class_name,
@@ -656,6 +743,11 @@ class RouterStep(TaskStep):
         if not route:
             route = TaskStep(class_name, class_args, handler=handler)
         route.function = function or route.function
+
+        if len(self._routes) >= MAX_ALLOWED_STEPS:
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                f"Cannot create the serving graph: the maximum number of steps is {MAX_ALLOWED_STEPS}"
+            )
         route = self._routes.update(key, route)
         route.set_parent(self)
         return route
@@ -713,6 +805,106 @@ class RouterStep(TaskStep):
         )
 
 
+class Model(storey.ParallelExecutionRunnable):
+    def load(self) -> None:
+        """Override to load model if needed."""
+        pass
+
+    def init(self):
+        self.load()
+
+    def predict(self, body: Any) -> Any:
+        """Override to implement prediction logic. If the logic requires asyncio, override predict_async() instead."""
+        return body
+
+    async def predict_async(self, body: Any) -> Any:
+        """Override to implement prediction logic if the logic requires asyncio."""
+        return body
+
+    def run(self, body: Any, path: str) -> Any:
+        return self.predict(body)
+
+    async def run_async(self, body: Any, path: str) -> Any:
+        return self.predict(body)
+
+
+class ModelSelector:
+    """Used to select which models to run on each event."""
+
+    def select(
+        self, event, available_models: list[Model]
+    ) -> Union[list[str], list[Model]]:
+        """
+        Given an event, returns a list of model names or a list of model objects to run on the event.
+        If None is returned, all models will be run.
+
+        :param event: The full event
+        :param available_models: List of available models
+        """
+        pass
+
+
+class ModelRunner(storey.ParallelExecution):
+    """
+    Runs multiple Models on each event. See ModelRunnerStep.
+
+    :param model_selector: ModelSelector instance whose select() method will be used to select models to run on each
+      event. Optional. If not passed, all models will be run.
+    """
+
+    def __init__(self, *args, model_selector: Optional[ModelSelector] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.model_selector = model_selector or ModelSelector()
+
+    def select_runnables(self, event):
+        models = cast(list[Model], self.runnables)
+        return self.model_selector.select(event, models)
+
+
+class ModelRunnerStep(TaskStep):
+    """
+    Runs multiple Models on each event.
+
+    example::
+
+        model_runner_step = ModelRunnerStep(name="my_model_runner")
+        model_runner_step.add_model(MyModel(name="my_model"))
+        graph.to(model_runner_step)
+
+    :param model_selector: ModelSelector instance whose select() method will be used to select models to run on each
+      event. Optional. If not passed, all models will be run.
+    """
+
+    kind = "model_runner"
+
+    def __init__(
+        self,
+        *args,
+        model_selector: Optional[Union[str, ModelSelector]] = None,
+        **kwargs,
+    ):
+        self._models = []
+        super().__init__(
+            *args,
+            class_name="mlrun.serving.ModelRunner",
+            class_args=dict(runnables=self._models, model_selector=model_selector),
+            **kwargs,
+        )
+
+    def add_model(self, model: Model) -> None:
+        """Add a Model to this ModelRunner."""
+        self._models.append(model)
+
+    def init_object(self, context, namespace, mode="sync", reset=False, **extra_kwargs):
+        model_selector = self.class_args.get("model_selector")
+        if isinstance(model_selector, str):
+            model_selector = get_class(model_selector, namespace)()
+        self._async_object = ModelRunner(
+            self.class_args.get("runnables"),
+            model_selector=model_selector,
+        )
+
+
 class QueueStep(BaseStep):
     """queue step, implement an async queue or represent a stream"""
 
@@ -728,12 +920,12 @@ class QueueStep(BaseStep):
 
     def __init__(
         self,
-        name: str = None,
-        path: str = None,
-        after: list = None,
-        shards: int = None,
-        retention_in_hours: int = None,
-        trigger_args: dict = None,
+        name: Optional[str] = None,
+        path: Optional[str] = None,
+        after: Optional[list] = None,
+        shards: Optional[int] = None,
+        retention_in_hours: Optional[int] = None,
+        trigger_args: Optional[dict] = None,
         **options,
     ):
         super().__init__(name, after)
@@ -754,11 +946,42 @@ class QueueStep(BaseStep):
                 retention_in_hours=self.retention_in_hours,
                 **self.options,
             )
+            if hasattr(self._stream, "create_stream"):
+                self._stream.create_stream()
         self._set_error_handler()
 
     @property
     def async_object(self):
         return self._async_object
+
+    def to(
+        self,
+        class_name: Union[str, StepToDict] = None,
+        name: Optional[str] = None,
+        handler: Optional[str] = None,
+        graph_shape: Optional[str] = None,
+        function: Optional[str] = None,
+        full_event: Optional[bool] = None,
+        input_path: Optional[str] = None,
+        result_path: Optional[str] = None,
+        **class_args,
+    ):
+        if not function:
+            name = get_name(name, class_name)
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                f"step '{name}' must specify a function, because it follows a queue step"
+            )
+        return super().to(
+            class_name,
+            name,
+            handler,
+            graph_shape,
+            function,
+            full_event,
+            input_path,
+            result_path,
+            **class_args,
+        )
 
     def run(self, event, *args, **kwargs):
         data = event.body
@@ -766,7 +989,10 @@ class QueueStep(BaseStep):
             return event
 
         if self._stream:
-            self._stream.push({"id": event.id, "body": data, "path": event.path})
+            full_event = self.options.get("full_event")
+            if full_event or full_event is None and self.next:
+                data = storey.utils.wrap_event_for_serialization(event, data)
+            self._stream.push(data)
             event.terminated = True
             event.body = None
         return event
@@ -786,7 +1012,7 @@ class FlowStep(BaseStep):
         self,
         name=None,
         steps=None,
-        after: list = None,
+        after: Optional[list] = None,
         engine=None,
         final_step=None,
     ):
@@ -829,9 +1055,9 @@ class FlowStep(BaseStep):
         before=None,
         graph_shape=None,
         function=None,
-        full_event: bool = None,
-        input_path: str = None,
-        result_path: str = None,
+        full_event: Optional[bool] = None,
+        input_path: Optional[str] = None,
+        result_path: Optional[str] = None,
         **class_args,
     ):
         """add task, queue or router step/class to the flow
@@ -918,7 +1144,7 @@ class FlowStep(BaseStep):
         self._last_added = step
         return step
 
-    def clear_children(self, steps: list = None):
+    def clear_children(self, steps: Optional[list] = None):
         """remove some or all of the states, empty/None for all"""
         if not steps:
             steps = self._steps.keys()
@@ -1130,8 +1356,8 @@ class FlowStep(BaseStep):
                     links[next_step.function] = step
         return links
 
-    def init_queues(self):
-        """init/create the streams used in this flow"""
+    def create_queue_streams(self):
+        """create the streams used in this flow"""
         for step in self.get_children():
             if step.kind == StepKinds.queue:
                 step.init_object(self.context, None)
@@ -1163,14 +1389,24 @@ class FlowStep(BaseStep):
         if self._controller:
             # async flow (using storey)
             event._awaitable_result = None
-            resp = self._controller.emit(
-                event, return_awaitable_result=self._wait_for_result
-            )
-            if self._wait_for_result and resp:
-                return resp.await_result()
+            if self.context.is_mock:
+                resp = self._controller.emit(
+                    event, return_awaitable_result=self._wait_for_result
+                )
+                if self._wait_for_result and resp:
+                    return resp.await_result()
+            else:
+                resp_awaitable = self._controller.emit(
+                    event, await_result=self._wait_for_result
+                )
+                if self._wait_for_result:
+                    return resp_awaitable
+                return self._await_and_return_id(resp_awaitable, event)
             event = copy(event)
             event.body = {"id": event.id}
             return event
+
+        event = storey.utils.unpack_event_if_wrapped(event)
 
         if len(self._start_steps) == 0:
             return event
@@ -1208,8 +1444,9 @@ class FlowStep(BaseStep):
 
         if self._controller:
             if hasattr(self._controller, "terminate"):
-                self._controller.terminate()
-            return self._controller.await_termination()
+                return self._controller.terminate(wait=True)
+            else:
+                return self._controller.await_termination()
 
     def plot(self, filename=None, format=None, source=None, targets=None, **kw):
         """plot/save graph using graphviz
@@ -1258,6 +1495,30 @@ class FlowStep(BaseStep):
                 )
             self[step_name].after_step(name)
 
+    def set_flow(
+        self,
+        steps: list[Union[str, StepToDict, dict[str, Any]]],
+        force: bool = False,
+    ):
+        if not force and self.steps:
+            raise mlrun.errors.MLRunInvalidArgumentError(
+                "set_flow() called on a step that already has downstream steps. "
+                "If you want to overwrite existing steps, set force=True."
+            )
+
+        self.steps = None
+        step = self
+        for next_step in steps:
+            if isinstance(next_step, dict):
+                step = step.to(**next_step)
+            else:
+                step = step.to(next_step)
+
+        return step
+
+    def supports_termination(self):
+        return self.engine != "sync"
+
 
 class RootFlowStep(FlowStep):
     """root flow step"""
@@ -1272,6 +1533,8 @@ classes_map = {
     "flow": FlowStep,
     "queue": QueueStep,
     "error_step": ErrorStep,
+    "monitoring_application": MonitoringApplicationStep,
+    "model_runner": ModelRunnerStep,
 }
 
 
@@ -1408,8 +1671,8 @@ def params_to_step(
     graph_shape=None,
     function=None,
     full_event=None,
-    input_path: str = None,
-    result_path: str = None,
+    input_path: Optional[str] = None,
+    result_path: Optional[str] = None,
     class_args=None,
 ):
     """return step object from provided params or classes/objects"""
@@ -1495,7 +1758,11 @@ def _init_async_objects(context, steps):
                 if step.path and not skip_stream:
                     stream_path = step.path
                     endpoint = None
-                    options = {}
+                    # in case of a queue, we default to a full_event=True
+                    full_event = step.options.get("full_event")
+                    options = {
+                        "full_event": full_event or full_event is None and step.next
+                    }
                     options.update(step.options)
 
                     kafka_brokers = get_kafka_brokers_from_dict(options, pop=True)
@@ -1549,10 +1816,16 @@ def _init_async_objects(context, steps):
                 wait_for_result = True
 
     source_args = context.get_param("source_args", {})
-    explicit_ack = is_explicit_ack_supported(context) and mlrun.mlconf.is_explicit_ack()
+    explicit_ack = (
+        is_explicit_ack_supported(context) and mlrun.mlconf.is_explicit_ack_enabled()
+    )
 
-    # TODO: Change to AsyncEmitSource once we can drop support for nuclio<1.12.10
-    default_source = storey.SyncEmitSource(
+    if context.is_mock:
+        source_class = storey.SyncEmitSource
+    else:
+        source_class = storey.AsyncEmitSource
+
+    default_source = source_class(
         context=context,
         explicit_ack=explicit_ack,
         **source_args,

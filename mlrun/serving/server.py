@@ -22,10 +22,14 @@ import traceback
 import uuid
 from typing import Optional, Union
 
+from nuclio import Context as NuclioContext
+from nuclio.request import Logger as NuclioLogger
+
 import mlrun
 import mlrun.common.constants
 import mlrun.common.helpers
 import mlrun.model_monitoring
+import mlrun.utils
 from mlrun.config import config
 from mlrun.errors import err_to_str
 from mlrun.secrets import SecretsStore
@@ -38,10 +42,7 @@ from ..errors import MLRunInvalidArgumentError
 from ..model import ModelObj
 from ..utils import get_caller_globals
 from .states import RootFlowStep, RouterStep, get_function, graph_root_setter
-from .utils import (
-    event_id_key,
-    event_path_key,
-)
+from .utils import event_id_key, event_path_key
 
 
 class _StreamContext:
@@ -71,15 +72,15 @@ class _StreamContext:
                 function_uri, config.default_project
             )
 
-            stream_uri = mlrun.model_monitoring.get_stream_path(project=project)
+            self.stream_uri = mlrun.model_monitoring.get_stream_path(project=project)
 
             if log_stream:
                 # Update the stream path to the log stream value
-                stream_uri = log_stream.format(project=project)
+                self.stream_uri = log_stream.format(project=project)
 
             stream_args = parameters.get("stream_args", {})
 
-            self.output_stream = get_stream_pusher(stream_uri, **stream_args)
+            self.output_stream = get_stream_pusher(self.stream_uri, **stream_args)
 
 
 class GraphServer(ModelObj):
@@ -100,6 +101,9 @@ class GraphServer(ModelObj):
         tracking_policy=None,
         secret_sources=None,
         default_content_type=None,
+        function_name=None,
+        function_tag=None,
+        project=None,
     ):
         self._graph = None
         self.graph: Union[RouterStep, RootFlowStep] = graph
@@ -122,6 +126,9 @@ class GraphServer(ModelObj):
         self.resource_cache = None
         self.default_content_type = default_content_type
         self.http_trigger = True
+        self.function_name = function_name
+        self.function_tag = function_tag
+        self.project = project
 
     def set_current_function(self, function):
         """set which child function this server is currently running on"""
@@ -153,6 +160,7 @@ class GraphServer(ModelObj):
         resource_cache: ResourceCache = None,
         logger=None,
         is_mock=False,
+        monitoring_mock=False,
     ):
         """for internal use, initialize all steps (recursively)"""
 
@@ -165,6 +173,7 @@ class GraphServer(ModelObj):
 
         context = GraphContext(server=self, nuclio_context=context, logger=logger)
         context.is_mock = is_mock
+        context.monitoring_mock = monitoring_mock
         context.root = self.graph
 
         context.stream = _StreamContext(
@@ -193,7 +202,7 @@ class GraphServer(ModelObj):
     def test(
         self,
         path: str = "/",
-        body: Union[str, bytes, dict] = None,
+        body: Optional[Union[str, bytes, dict]] = None,
         method: str = "",
         headers: Optional[str] = None,
         content_type: Optional[str] = None,
@@ -321,9 +330,9 @@ def v2_serving_init(context, namespace=None):
         server.http_trigger = getattr(context.trigger, "kind", "http") == "http"
     context.logger.info_with(
         "Setting current function",
-        current_functiton=os.environ.get("SERVING_CURRENT_FUNCTION", ""),
+        current_function=os.getenv("SERVING_CURRENT_FUNCTION", ""),
     )
-    server.set_current_function(os.environ.get("SERVING_CURRENT_FUNCTION", ""))
+    server.set_current_function(os.getenv("SERVING_CURRENT_FUNCTION", ""))
     context.logger.info_with(
         "Initializing states", namespace=namespace or get_caller_globals()
     )
@@ -344,28 +353,37 @@ def v2_serving_init(context, namespace=None):
     if server.verbose:
         context.logger.info(server.to_yaml())
 
-    if hasattr(context, "platform") and hasattr(
-        context.platform, "set_termination_callback"
-    ):
+    _set_callbacks(server, context)
+
+
+def _set_callbacks(server, context):
+    if not server.graph.supports_termination() or not hasattr(context, "platform"):
+        return
+
+    if hasattr(context.platform, "set_termination_callback"):
         context.logger.info(
             "Setting termination callback to terminate graph on worker shutdown"
         )
 
         async def termination_callback():
             context.logger.info("Termination callback called")
-            server.wait_for_completion()
+            maybe_coroutine = server.wait_for_completion()
+            if asyncio.iscoroutine(maybe_coroutine):
+                await maybe_coroutine
             context.logger.info("Termination of async flow is completed")
 
         context.platform.set_termination_callback(termination_callback)
 
-    if hasattr(context, "platform") and hasattr(context.platform, "set_drain_callback"):
+    if hasattr(context.platform, "set_drain_callback"):
         context.logger.info(
             "Setting drain callback to terminate and restart the graph on a drain event (such as rebalancing)"
         )
 
         async def drain_callback():
             context.logger.info("Drain callback called")
-            server.wait_for_completion()
+            maybe_coroutine = server.wait_for_completion()
+            if asyncio.iscoroutine(maybe_coroutine):
+                await maybe_coroutine
             context.logger.info(
                 "Termination of async flow is completed. Rerunning async flow."
             )
@@ -383,11 +401,26 @@ def v2_serving_handler(context, event, get_body=False):
         if event.body == b"":
             event.body = None
 
+    # original path is saved in stream_path so it can be used by explicit ack, but path is reset to / as a
+    # workaround for NUC-178
+    # nuclio 1.12.12 added the topic attribute, and we must use it as part of the fix for NUC-233
+    # TODO: Remove fallback on event.path once support for nuclio<1.12.12 is dropped
+    event.stream_path = getattr(event, "topic", event.path)
+    if hasattr(event, "trigger") and event.trigger.kind in (
+        "kafka",
+        "kafka-cluster",
+        "v3ioStream",
+        "v3io-stream",
+        "rabbit-mq",
+        "rabbitMq",
+    ):
+        event.path = "/"
+
     return context._server.run(event, context, get_body)
 
 
 def create_graph_server(
-    parameters={},
+    parameters=None,
     load_mode=None,
     graph=None,
     verbose=False,
@@ -403,9 +436,10 @@ def create_graph_server(
         server.graph.add_route("my", class_name=MyModelClass, model_path="{path}", z=100)
         print(server.test("/v2/models/my/infer", testdata))
     """
+    parameters = parameters or {}
     server = GraphServer(graph, parameters, load_mode, verbose=verbose, **kwargs)
     server.set_current_function(
-        current_function or os.environ.get("SERVING_CURRENT_FUNCTION", "")
+        current_function or os.getenv("SERVING_CURRENT_FUNCTION", "")
     )
     return server
 
@@ -469,7 +503,13 @@ class Response:
 class GraphContext:
     """Graph context object"""
 
-    def __init__(self, level="info", logger=None, server=None, nuclio_context=None):
+    def __init__(
+        self,
+        level="info",  # Unused argument
+        logger=None,
+        server=None,
+        nuclio_context: Optional[NuclioContext] = None,
+    ) -> None:
         self.state = None
         self.logger = logger
         self.worker_id = 0
@@ -479,7 +519,7 @@ class GraphContext:
         self.root = None
 
         if nuclio_context:
-            self.logger = nuclio_context.logger
+            self.logger: NuclioLogger = nuclio_context.logger
             self.Response = nuclio_context.Response
             if hasattr(nuclio_context, "trigger") and hasattr(
                 nuclio_context.trigger, "kind"
@@ -489,7 +529,7 @@ class GraphContext:
             if hasattr(nuclio_context, "platform"):
                 self.platform = nuclio_context.platform
         elif not logger:
-            self.logger = mlrun.utils.helpers.logger
+            self.logger: mlrun.utils.Logger = mlrun.utils.logger
 
         self._server = server
         self.current_function = None
@@ -502,7 +542,7 @@ class GraphContext:
         return self._server
 
     @property
-    def project(self):
+    def project(self) -> str:
         """current project name (for the current function)"""
         project, _, _, _ = mlrun.common.helpers.parse_versioned_object_uri(
             self._server.function_uri

@@ -11,13 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
 
 import pathlib
+from collections.abc import Iterator
 
 import pandas as pd
+import pytest
 
 import mlrun
+import mlrun.datastore.inmem
 from mlrun import new_function, new_task
 from tests.conftest import out_path, tag_test, tests_root_directory, verify_state
 
@@ -31,7 +33,17 @@ input_file_path = str(
 base_spec.spec.inputs = {"infile.txt": str(input_file_path)}
 
 
-def test_handler_hyper():
+@pytest.fixture(autouse=True, scope="module")
+def _clean_shared_in_mem_store() -> Iterator[None]:
+    """
+    Tests in this module use the general in memory store.
+    Clean it after the tests complete to avoid cross-contamination with other modules.
+    """
+    yield
+    mlrun.datastore.in_memory_store = mlrun.datastore.inmem.InMemoryStore()
+
+
+def test_handler_hyper(rundb_mock):
     run_spec = tag_test(base_spec, "test_handler_hyper")
     run_spec.with_hyper_params({"p1": [1, 5, 3]}, selector="max.accuracy")
     result = new_function().run(run_spec, handler=my_func)

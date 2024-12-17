@@ -20,6 +20,7 @@ import unittest.mock
 import uuid
 from contextlib import nullcontext as does_not_raise
 
+import deepdiff
 import pandas as pd
 import pytest
 import yaml
@@ -37,7 +38,6 @@ results_dir = (pathlib.Path(conftest.results) / "artifacts").absolute()
 def test_artifacts_export_required_fields():
     artifact_classes = [
         mlrun.artifacts.Artifact,
-        mlrun.artifacts.ChartArtifact,
         mlrun.artifacts.PlotArtifact,
         mlrun.artifacts.DatasetArtifact,
         mlrun.artifacts.ModelArtifact,
@@ -288,6 +288,7 @@ def test_log_artifact(
         generate_target_path
     )
 
+    monkeypatch.setenv("V3IO_ACCESS_KEY", "123")
     monkeypatch.setattr(
         mlrun.datastore.DataItem,
         "upload",
@@ -355,6 +356,45 @@ def test_log_artifact_with_target_path_and_upload_options(target_path, upload_op
         # if target path is given and upload is not True, we don't upload and therefore don't calculate hash
         assert logged_artifact.target_path == target_path
         assert logged_artifact.metadata.hash is None
+
+
+@pytest.mark.parametrize(
+    "artifact_key,expected",
+    [
+        ("artifact@key", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        ("artifact#key", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        ("artifact!key", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        ("artifact_key!", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        ("artifact/key", pytest.raises(mlrun.errors.MLRunInvalidArgumentError)),
+        ("artifact_key123", does_not_raise()),
+        ("artifact-key", does_not_raise()),
+        ("artifact.key", does_not_raise()),
+    ],
+)
+def test_log_artifact_with_invalid_key(artifact_key, expected):
+    project = mlrun.new_project("test-project")
+    target_path = "s3://some/path"
+    artifact = mlrun.artifacts.Artifact(
+        key=artifact_key, body="123", target_path=target_path
+    )
+    with expected:
+        project.log_artifact(artifact)
+
+    # now test log_artifact with db_key that is different than the artifact's key
+    artifact = mlrun.artifacts.Artifact(
+        key="some-key", body="123", target_path=target_path
+    )
+    artifact.spec.db_key = artifact_key
+    with expected:
+        project.log_artifact(artifact)
+
+    # when storing an artifact with producer.kind="run", the value of db_key is modified to: producer.name + "_" + key
+    # and in this case since key="some-key", the db_key will always be valid
+    context = mlrun.get_or_create_ctx("test")
+    try:
+        context.log_artifact(item=artifact)
+    except Exception as e:
+        pytest.fail(f"Unexpected exception raised: {e}")
 
 
 @pytest.mark.parametrize(
@@ -625,3 +665,46 @@ def test_producer_in_exported_artifact():
     with open(artifact_path) as file:
         exported_artifact = yaml.load(file, Loader=yaml.FullLoader)
         assert "producer" not in exported_artifact["spec"]
+
+
+@pytest.mark.parametrize(
+    "uri,expected_parsed_result",
+    [
+        # Full URI
+        (
+            "my-project/1234-1",
+            ("my-project", "1234", "1"),
+        ),
+        # No iteration
+        (
+            "my-project/1234",
+            ("my-project", "1234", ""),
+        ),
+        # No project
+        (
+            "1234-1",
+            ("", "1234", "1"),
+        ),
+        # No UID
+        (
+            "my-project/-1",
+            ("my-project", "", "1"),
+        ),
+        # just iteration
+        (
+            "-1",
+            ("", "", "1"),
+        ),
+        # Nothing
+        (
+            "",
+            ("", "", ""),
+        ),
+    ],
+)
+def test_artifact_producer_parse_uri(uri, expected_parsed_result):
+    parsed_result = mlrun.artifacts.ArtifactProducer.parse_uri(uri)
+    assert (
+        deepdiff.DeepDiff(parsed_result, expected_parsed_result, ignore_order=True)
+        == {}
+    )

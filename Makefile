@@ -33,7 +33,9 @@ MLRUN_ML_DOCKER_IMAGE_NAME_PREFIX ?= ml-
 MLRUN_PYTHON_VERSION ?= 3.9
 MLRUN_SKIP_COMPILE_SCHEMAS ?=
 INCLUDE_PYTHON_VERSION_SUFFIX ?=
-MLRUN_PIP_VERSION ?= 23.2.1
+MLRUN_PIP_VERSION ?= 24.2
+MLRUN_UV_VERSION ?= 0.5.8
+MLRUN_UV_IMAGE ?= ghcr.io/astral-sh/uv:$(MLRUN_UV_VERSION)
 MLRUN_CACHE_DATE ?= $(shell date +%s)
 # empty by default, can be set to something like "tag-name" which will cause to:
 # 1. docker pull the same image with the given tag (cache image) before the build
@@ -48,13 +50,13 @@ MLRUN_RAISE_ON_ERROR ?= true
 MLRUN_SKIP_CLONE ?= false
 MLRUN_RELEASE_NOTES_OUTPUT_FILE ?=
 MLRUN_SYSTEM_TESTS_CLEAN_RESOURCES ?= true
+MLRUN_SYSTEM_TEST_MARKERS ?=
 MLRUN_SYSTEM_TESTS_GITHUB_RUN_URL ?=
-MLRUN_GPU_CUDA_VERSION ?= 11.7.1-cudnn8-devel-ubuntu20.04
+MLRUN_GPU_CUDA_VERSION ?= 11.8.0-cudnn8-devel-ubuntu22.04
 
 # THIS BLOCK IS FOR COMPUTED VARIABLES
 MLRUN_DOCKER_IMAGE_PREFIX := $(if $(MLRUN_DOCKER_REGISTRY),$(strip $(MLRUN_DOCKER_REGISTRY))$(MLRUN_DOCKER_REPO),$(MLRUN_DOCKER_REPO))
 MLRUN_CACHE_DOCKER_IMAGE_PREFIX := $(if $(MLRUN_DOCKER_CACHE_FROM_REGISTRY),$(strip $(MLRUN_DOCKER_CACHE_FROM_REGISTRY))$(MLRUN_DOCKER_REPO),$(MLRUN_DOCKER_REPO))
-MLRUN_CORE_DOCKER_TAG_SUFFIX := -core
 MLRUN_DOCKER_CACHE_FROM_FLAG :=
 # if MLRUN_NO_CACHE passed we don't want to use cache, this is mainly used for cleaner if statements
 MLRUN_USE_CACHE := $(if $(MLRUN_NO_CACHE),,true)
@@ -63,6 +65,11 @@ MLRUN_PIP_NO_CACHE_FLAG := $(if $(MLRUN_NO_CACHE),--no-cache-dir,)
 # expected to be in the form of '-py<major><minor>' e.g. '-py39'
 MLRUN_ANACONDA_PYTHON_DISTRIBUTION := $(shell echo "$(MLRUN_PYTHON_VERSION)" | awk -F. '{print "-py"$$1$$2}')
 MLRUN_PYTHON_VERSION_SUFFIX := $(if $(INCLUDE_PYTHON_VERSION_SUFFIX),$(MLRUN_ANACONDA_PYTHON_DISTRIBUTION),)
+
+# expected to be in the form of 'py<major><minor>' e.g. 'py39'
+MLRUN_LINT_PYTHON_VERSION := $(shell echo "$(MLRUN_PYTHON_VERSION)" | awk -F. '{print "py"$$1$$2}')
+
+MLRUN_PIPELINES_KFP_VERSION := $(if $(filter 3.9,$(MLRUN_PYTHON_VERSION)),1-8,2)
 
 MLRUN_OLD_VERSION_ESCAPED = $(shell echo "$(MLRUN_OLD_VERSION)" | sed 's/\./\\\./g')
 MLRUN_BC_TESTS_OPENAPI_OUTPUT_PATH ?= $(shell pwd)
@@ -80,6 +87,18 @@ else
 	MLRUN_SYSTEM_TESTS_COMMAND_SUFFIX = "--ignore=tests/system/$(MLRUN_SYSTEM_TESTS_COMPONENT) tests/system"
 endif
 
+MLRUN_PYTHON_PACKAGE_INSTALLER ?= pip
+ifeq ($(MLRUN_PYTHON_PACKAGE_INSTALLER),pip)
+	MLRUN_PYTHON_VENV_PIP_INSTALL ?= python -m pip install
+else ifeq ($(MLRUN_PYTHON_PACKAGE_INSTALLER),uv)
+	MLRUN_PYTHON_VENV_PIP_INSTALL ?= uv pip install
+else
+	$(error MLRUN_PYTHON_PACKAGE_INSTALLER must be either "pip" or "uv")
+endif
+
+# Change to `--upgrade-package <package-name>` to upgrade only a specific package
+MLRUN_UV_UPGRADE_FLAG ?= --upgrade
+
 .PHONY: help
 help: ## Display available commands
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -90,8 +109,12 @@ all:
 
 .PHONY: install-requirements
 install-requirements: ## Install all requirements needed for development
-	python -m pip install --upgrade $(MLRUN_PIP_NO_CACHE_FLAG) pip~=$(MLRUN_PIP_VERSION)
-	python -m pip install \
+	# relevant for pip package installer only
+	@if [ "$(MLRUN_PYTHON_PACKAGE_INSTALLER)" = "pip" ]; then \
+		$(MLRUN_PYTHON_VENV_PIP_INSTALL) --upgrade $(MLRUN_PIP_NO_CACHE_FLAG) pip~=$(MLRUN_PIP_VERSION); \
+	fi
+
+	$(MLRUN_PYTHON_VENV_PIP_INSTALL) \
 		$(MLRUN_PIP_NO_CACHE_FLAG) \
 		-r requirements.txt \
 		-r extras-requirements.txt \
@@ -106,24 +129,20 @@ install-conda-requirements: ## Install all requirements needed for development w
 
 .PHONY: install-complete-requirements
 install-complete-requirements: ## Install all requirements needed for development and testing
-	python -m pip install --upgrade $(MLRUN_PIP_NO_CACHE_FLAG) pip~=$(MLRUN_PIP_VERSION)
-	python -m pip install .[complete]
+	$(MLRUN_PYTHON_VENV_PIP_INSTALL) --upgrade $(MLRUN_PIP_NO_CACHE_FLAG) pip~=$(MLRUN_PIP_VERSION)
+	$(MLRUN_PYTHON_VENV_PIP_INSTALL) .[complete]
 
 .PHONY: install-all-requirements
 install-all-requirements: ## Install all requirements needed for development and testing
-	python -m pip install --upgrade $(MLRUN_PIP_NO_CACHE_FLAG) pip~=$(MLRUN_PIP_VERSION)
-	python -m pip install .[all]
-
-.PHONY: create-migration-sqlite
-create-migration-sqlite: ## Create a DB migration (MLRUN_MIGRATION_MESSAGE must be set)
-	./automation/scripts/create_migration_sqlite.sh
+	$(MLRUN_PYTHON_VENV_PIP_INSTALL) --upgrade $(MLRUN_PIP_NO_CACHE_FLAG) pip~=$(MLRUN_PIP_VERSION)
+	$(MLRUN_PYTHON_VENV_PIP_INSTALL) .[all]
 
 .PHONY: create-migration-mysql
 create-migration-mysql: ## Create a DB migration (MLRUN_MIGRATION_MESSAGE must be set)
 	./automation/scripts/create_migration_mysql.sh
 
 .PHONY: create-migration
-create-migration: create-migration-sqlite create-migration-mysql
+create-migration: create-migration-mysql
 	@echo "Migrations created successfully"
 
 .PHONY: bump-version
@@ -142,6 +161,25 @@ endif
 .PHONY: update-version-file
 update-version-file: ## Update the version file
 	python ./automation/version/version_file.py ensure --mlrun-version $(MLRUN_VERSION)
+
+.PHONY: generate-dockerignore
+generate-dockerignore: ## Copies the root .dockerignore and removes the tests pattern from it
+	$(eval TARGET := dockerfiles/${DEST}/Dockerfile.dockerignore)
+	@if [ -f "$(TARGET)" ]; then \
+		temp_file=$$(mktemp) && \
+		sed '/\*\*\/tests/d' .dockerignore > $$temp_file && \
+		if cmp -s $$temp_file "$(TARGET)"; then \
+			echo "File $(TARGET) already exists and content is identical"; \
+			rm $$temp_file; \
+			exit 0; \
+		else \
+			echo "File $(TARGET) exists but content differs, updating..."; \
+			mv $$temp_file "$(TARGET)"; \
+		fi; \
+	else \
+		sed '/\*\*\/tests/d' .dockerignore > "$(TARGET)"; \
+	fi
+
 
 .PHONY: build
 build: docker-images package-wheel ## Build all artifacts
@@ -189,6 +227,7 @@ mlrun: update-version-file ## Build mlrun docker image
 		--build-arg MLRUN_ANACONDA_PYTHON_DISTRIBUTION=$(MLRUN_ANACONDA_PYTHON_DISTRIBUTION) \
 		--build-arg MLRUN_PYTHON_VERSION=$(MLRUN_PYTHON_VERSION) \
 		--build-arg MLRUN_PIP_VERSION=$(MLRUN_PIP_VERSION) \
+		--build-arg MLRUN_UV_IMAGE=$(MLRUN_UV_IMAGE) \
 		$(MLRUN_IMAGE_DOCKER_CACHE_FROM_FLAG) \
 		$(MLRUN_DOCKER_NO_CACHE_FLAG) \
 		--tag $(MLRUN_IMAGE_NAME_TAGGED) .
@@ -218,6 +257,7 @@ mlrun-gpu: update-version-file ## Build mlrun gpu docker image
 	docker build \
 		--file dockerfiles/gpu/Dockerfile \
 		--build-arg MLRUN_GPU_BASE_IMAGE=$(MLRUN_GPU_PREBAKED_IMAGE_NAME_TAGGED) \
+		--build-arg MLRUN_UV_IMAGE=$(MLRUN_UV_IMAGE) \
 		$(MLRUN_GPU_IMAGE_DOCKER_CACHE_FROM_FLAG) \
 		$(MLRUN_DOCKER_NO_CACHE_FLAG) \
 		--tag $(MLRUN_GPU_IMAGE_NAME_TAGGED) \
@@ -248,28 +288,19 @@ push-prebake-mlrun-gpu: ## Push prebake mlrun GPU based docker image
 MLRUN_BASE_IMAGE_NAME := $(MLRUN_DOCKER_IMAGE_PREFIX)/$(MLRUN_ML_DOCKER_IMAGE_NAME_PREFIX)base
 MLRUN_BASE_CACHE_IMAGE_NAME := $(MLRUN_CACHE_DOCKER_IMAGE_PREFIX)/$(MLRUN_ML_DOCKER_IMAGE_NAME_PREFIX)base
 MLRUN_BASE_IMAGE_NAME_TAGGED := $(MLRUN_BASE_IMAGE_NAME):$(MLRUN_DOCKER_TAG)$(MLRUN_PYTHON_VERSION_SUFFIX)
-MLRUN_CORE_BASE_IMAGE_NAME_TAGGED := $(MLRUN_BASE_IMAGE_NAME_TAGGED)$(MLRUN_CORE_DOCKER_TAG_SUFFIX)
 MLRUN_BASE_CACHE_IMAGE_NAME_TAGGED := $(MLRUN_BASE_CACHE_IMAGE_NAME):$(MLRUN_DOCKER_CACHE_FROM_TAG)$(MLRUN_PYTHON_VERSION_SUFFIX)
 MLRUN_BASE_IMAGE_DOCKER_CACHE_FROM_FLAG := $(if $(and $(MLRUN_DOCKER_CACHE_FROM_TAG),$(MLRUN_USE_CACHE)),--cache-from $(strip $(MLRUN_BASE_CACHE_IMAGE_NAME_TAGGED)),)
 MLRUN_BASE_CACHE_IMAGE_PUSH_COMMAND := $(if $(and $(MLRUN_DOCKER_CACHE_FROM_TAG),$(MLRUN_PUSH_DOCKER_CACHE_IMAGE)),docker tag $(MLRUN_BASE_IMAGE_NAME_TAGGED) $(MLRUN_BASE_CACHE_IMAGE_NAME_TAGGED) && docker push $(MLRUN_BASE_CACHE_IMAGE_NAME_TAGGED),)
 DEFAULT_IMAGES += $(MLRUN_BASE_IMAGE_NAME_TAGGED)
 
-.PHONY: base-core
-base-core: pull-cache update-version-file ## Build base core docker image
+.PHONY: base
+base: pull-cache update-version-file ## Build base docker image
 	docker build \
 		--file dockerfiles/base/Dockerfile \
 		--build-arg MLRUN_PYTHON_VERSION=$(MLRUN_PYTHON_VERSION) \
 		--build-arg MLRUN_ANACONDA_PYTHON_DISTRIBUTION=$(MLRUN_ANACONDA_PYTHON_DISTRIBUTION) \
 		--build-arg MLRUN_PIP_VERSION=$(MLRUN_PIP_VERSION) \
-		$(MLRUN_DOCKER_CACHE_FROM_FLAG) \
-		$(MLRUN_DOCKER_NO_CACHE_FLAG) \
-		--tag $(MLRUN_CORE_BASE_IMAGE_NAME_TAGGED) .
-
-.PHONY: base
-base: base-core ## Build base docker image
-	docker build \
-		--file dockerfiles/common/Dockerfile \
-		--build-arg MLRUN_BASE_IMAGE=$(MLRUN_CORE_BASE_IMAGE_NAME_TAGGED) \
+		--build-arg MLRUN_UV_IMAGE=$(MLRUN_UV_IMAGE) \
 		$(MLRUN_DOCKER_CACHE_FROM_FLAG) \
 		$(MLRUN_DOCKER_NO_CACHE_FLAG) \
 		--tag $(MLRUN_BASE_IMAGE_NAME_TAGGED) .
@@ -300,6 +331,7 @@ jupyter: update-version-file ## Build mlrun jupyter docker image
 		--build-arg MLRUN_PIP_VERSION=$(MLRUN_PIP_VERSION) \
 		--build-arg MLRUN_CACHE_DATE=$(MLRUN_CACHE_DATE) \
 		--build-arg MLRUN_PYTHON_VERSION=$(MLRUN_PYTHON_VERSION) \
+		--build-arg MLRUN_UV_IMAGE=$(MLRUN_UV_IMAGE) \
 		$(MLRUN_JUPYTER_IMAGE_DOCKER_CACHE_FROM_FLAG) \
 		$(MLRUN_DOCKER_NO_CACHE_FLAG) \
 		--tag $(MLRUN_JUPYTER_IMAGE_NAME_TAGGED) \
@@ -312,7 +344,7 @@ push-jupyter: jupyter ## Push mlrun jupyter docker image
 
 .PHONY: pull-jupyter
 pull-jupyter: ## Pull mlrun jupyter docker image
-	docker pull $(MLRUN_JUPYTER_IMAGE_NAME)
+	docker pull $(MLRUN_JUPYTER_IMAGE_NAME_TAGGED)
 
 .PHONY: log-collector
 log-collector: update-version-file
@@ -321,7 +353,7 @@ log-collector: update-version-file
 		MLRUN_DOCKER_REPO=$(MLRUN_DOCKER_REPO) \
 		MLRUN_DOCKER_TAG=$(MLRUN_DOCKER_TAG) \
 		MLRUN_DOCKER_IMAGE_PREFIX=$(MLRUN_DOCKER_IMAGE_PREFIX) \
-		make --no-print-directory -C $(shell pwd)/server/log-collector log-collector
+		make --no-print-directory -C $(shell pwd)/server/go log-collector
 
 .PHONY: push-log-collector
 push-log-collector: log-collector
@@ -330,7 +362,7 @@ push-log-collector: log-collector
 		MLRUN_DOCKER_REPO=$(MLRUN_DOCKER_REPO) \
 		MLRUN_DOCKER_TAG=$(MLRUN_DOCKER_TAG) \
 		MLRUN_DOCKER_IMAGE_PREFIX=$(MLRUN_DOCKER_IMAGE_PREFIX) \
-		make --no-print-directory -C $(shell pwd)/server/log-collector push-log-collector
+		make --no-print-directory -C $(shell pwd)/server/go push-log-collector
 
 .PHONY: pull-log-collector
 pull-log-collector:
@@ -339,7 +371,7 @@ pull-log-collector:
 		MLRUN_DOCKER_REPO=$(MLRUN_DOCKER_REPO) \
 		MLRUN_DOCKER_TAG=$(MLRUN_DOCKER_TAG) \
 		MLRUN_DOCKER_IMAGE_PREFIX=$(MLRUN_DOCKER_IMAGE_PREFIX) \
-		make --no-print-directory -C $(shell pwd)/server/log-collector pull-log-collector
+		make --no-print-directory -C $(shell pwd)/server/go pull-log-collector
 
 
 .PHONY: compile-schemas
@@ -347,8 +379,7 @@ compile-schemas: ## Compile schemas over docker
 ifdef MLRUN_SKIP_COMPILE_SCHEMAS
 	@echo "Skipping compile schemas"
 else
-	cd server/log-collector && \
-	  make compile-schemas
+	$(MAKE) -C server/go compile-schemas
 endif
 
 MLRUN_API_IMAGE_NAME := $(MLRUN_DOCKER_IMAGE_PREFIX)/mlrun-api
@@ -367,6 +398,7 @@ api: compile-schemas update-version-file ## Build mlrun-api docker image
 		--file dockerfiles/mlrun-api/Dockerfile \
 		--build-arg MLRUN_PYTHON_VERSION=$(MLRUN_PYTHON_VERSION) \
 		--build-arg MLRUN_PIP_VERSION=$(MLRUN_PIP_VERSION) \
+		--build-arg MLRUN_UV_IMAGE=$(MLRUN_UV_IMAGE) \
 		$(MLRUN_API_IMAGE_DOCKER_CACHE_FROM_FLAG) \
 		$(MLRUN_DOCKER_NO_CACHE_FLAG) \
 		--tag $(MLRUN_API_IMAGE_NAME_TAGGED) .
@@ -390,11 +422,13 @@ MLRUN_TEST_CACHE_IMAGE_PUSH_COMMAND := $(if $(and $(MLRUN_DOCKER_CACHE_FROM_TAG)
 
 .PHONY: build-test
 build-test: compile-schemas update-version-file ## Build test docker image
+	$(MAKE) generate-dockerignore DEST=test
 	$(MLRUN_TEST_CACHE_IMAGE_PULL_COMMAND)
 	docker build \
 		--file dockerfiles/test/Dockerfile \
 		--build-arg MLRUN_PYTHON_VERSION=$(MLRUN_PYTHON_VERSION) \
 		--build-arg MLRUN_PIP_VERSION=$(MLRUN_PIP_VERSION) \
+		--build-arg MLRUN_PIPELINES_KFP_VERSION=$(MLRUN_PIPELINES_KFP_VERSION) \
 		$(MLRUN_TEST_IMAGE_DOCKER_CACHE_FROM_FLAG) \
 		$(MLRUN_DOCKER_NO_CACHE_FLAG) \
 		--tag $(MLRUN_TEST_IMAGE_NAME_TAGGED) .
@@ -408,6 +442,7 @@ MLRUN_SYSTEM_TEST_IMAGE_NAME := $(MLRUN_DOCKER_IMAGE_PREFIX)/test-system:$(MLRUN
 
 .PHONY: build-test-system
 build-test-system: compile-schemas update-version-file ## Build system tests docker image
+	$(MAKE) generate-dockerignore DEST=test-system
 	docker build \
 		--file dockerfiles/test-system/Dockerfile \
 		--build-arg MLRUN_PYTHON_VERSION=$(MLRUN_PYTHON_VERSION) \
@@ -444,16 +479,18 @@ test-dockerized: build-test ## Run mlrun tests in docker container
 
 .PHONY: test
 test: clean ## Run mlrun tests
-	python -m pytest -v \
+	python \
+		-X faulthandler \
+		-m pytest -v \
 		--capture=no \
 		--disable-warnings \
 		--durations=100 \
 		--ignore=tests/integration \
 		--ignore=tests/system \
 		--ignore=tests/rundb/test_httpdb.py \
-		-rf \
-		tests
-
+		--ignore=server/py/services/api/migrations \
+		--forked \
+		-rf
 
 .PHONY: test-integration-dockerized
 test-integration-dockerized: build-test ## Run mlrun integration tests in docker container
@@ -481,19 +518,14 @@ test-migrations-dockerized: build-test ## Run mlrun db migrations tests in docke
 		-t \
 		--rm \
 		--network='host' \
+		-v $(shell pwd):/mlrun \
 		-v /tmp:/tmp \
 		-v /var/run/docker.sock:/var/run/docker.sock \
 		$(MLRUN_TEST_IMAGE_NAME_TAGGED) make test-migrations
 
 .PHONY: test-migrations
 test-migrations: clean ## Run mlrun db migrations tests
-	python -m pytest -v \
-		--capture=no \
-		--disable-warnings \
-		--durations=100 \
-		-rf \
-		--test-alembic \
-		server/api/migrations_sqlite/tests/*
+	./automation/scripts/test_migration_mysql.sh
 
 .PHONY: test-system-dockerized
 test-system-dockerized: build-test-system ## Run mlrun system tests in docker container
@@ -523,7 +555,7 @@ test-system-open-source: update-version-file ## Run mlrun system tests with open
 		--disable-warnings \
 		--durations=100 \
 		-rf \
-		-m "not enterprise" \
+		-m $(if $(MLRUN_SYSTEM_TEST_MARKERS),"$(MLRUN_SYSTEM_TEST_MARKERS)","not enterprise") \
 		$(MLRUN_SYSTEM_TESTS_COMMAND_SUFFIX)
 
 .PHONY: test-package compile-schemas
@@ -532,23 +564,19 @@ test-package: ## Run mlrun package tests
 
 .PHONY: test-go
 test-go-unit: ## Run mlrun go unit tests
-	cd server/log-collector && \
-		make test-unit-local
+	$(MAKE) -C server/go test-unit-local
 
 .PHONY: test-go-dockerized
 test-go-unit-dockerized: ## Run mlrun go unit tests in docker container
-	cd server/log-collector && \
-		make test-unit-dockerized
+	$(MAKE) -C server/go test-unit-dockerized
 
 .PHONY: test-go
 test-go-integration: ## Run mlrun go unit tests
-	cd server/log-collector && \
-		make test-integration-local
+	$(MAKE) -C server/go test-integration-local
 
 .PHONY: test-go-dockerized
 test-go-integration-dockerized: ## Run mlrun go integration tests in docker container
-	cd server/log-collector && \
-		make test-integration-dockerized
+	$(MAKE) -C server/go test-integration-dockerized
 
 .PHONY: run-api-undockerized
 run-api-undockerized: ## Run mlrun api locally (un-dockerized)
@@ -565,6 +593,7 @@ run-api: api ## Run mlrun api (dockerized)
 		--add-host host.docker.internal:host-gateway \
 		--env MLRUN_HTTPDB__DSN=$(MLRUN_HTTPDB__DSN) \
 		--env MLRUN_LOG_LEVEL=$(MLRUN_LOG_LEVEL) \
+		--env MLRUN_LOG_FORMATTER=$(MLRUN_LOG_FORMATTER) \
 		--env MLRUN_SECRET_STORES__TEST_MODE_MOCK_SECRETS=$(MLRUN_SECRET_STORES__TEST_MODE_MOCK_SECRETS) \
 		--env MLRUN_HTTPDB__REAL_PATH=$(MLRUN_HTTPDB__REAL_PATH) \
 		$(MLRUN_API_IMAGE_NAME_TAGGED)
@@ -575,22 +604,25 @@ run-test-db:
 	docker rm test-db --force || true
 	docker run \
 		--name=test-db \
-		-v $(shell pwd):/mlrun \
-		-p 3306:3306 \
-		-e MYSQL_ROOT_PASSWORD="" \
-		-e MYSQL_ALLOW_EMPTY_PASSWORD="true" \
-		-e MYSQL_ROOT_HOST=% \
-		-e MYSQL_DATABASE="mlrun" \
-		-d \
-		mysql/mysql-server:8.0 \
+		--volume $(shell pwd):/mlrun \
+		--publish 3306:3306 \
+		--env MYSQL_ROOT_PASSWORD="" \
+		--env MYSQL_ALLOW_EMPTY_PASSWORD="true" \
+		--env MYSQL_ROOT_HOST=% \
+		--env MYSQL_DATABASE="mlrun" \
+		--detach \
+		gcr.io/iguazio/mlrun-mysql:8.0 \
 		--character-set-server=utf8 \
-		--collation-server=utf8_bin \
-		--sql_mode=""
+		--collation-server=utf8_bin
+
+.PHONY: clean-html-docs
+clean-html-docs: ## Clean html docs
+	rm -f docs/external/*.md
+	make -C docs clean
 
 .PHONY: html-docs
-html-docs: ## Build html docs
-	rm -f docs/external/*.md
-	cd docs && make html
+html-docs: clean-html-docs ## Build html docs
+	make -C docs html
 
 .PHONY: html-docs-dockerized
 html-docs-dockerized: build-test ## Build html docs dockerized
@@ -601,10 +633,20 @@ html-docs-dockerized: build-test ## Build html docs dockerized
 		make html-docs
 
 .PHONY: fmt
-fmt: ## Format the code using Ruff
+fmt: ## Format the code using Ruff and blacken-docs
 	@echo "Running ruff checks and fixes..."
 	python -m ruff check --fix-only
 	python -m ruff format
+	@echo "Formatting the code blocks with blacken-docs..."
+	git ls-files -z -- '*.md' | xargs -0 blacken-docs -t="$(MLRUN_LINT_PYTHON_VERSION)"
+
+.PHONY: lint-docs
+lint-docs: ## Format the code blocks in markdown files
+	@echo "Checking the code blocks with blacken-docs"
+	git ls-files -z -- '*.md' | xargs -0 blacken-docs -t="$(MLRUN_LINT_PYTHON_VERSION)" --check
+	@if [ "$(SKIP_VALE_CHECK)" != "true" ]; then \
+	    make vale-docs; \
+	fi
 
 .PHONY: lint-imports
 lint-imports: ## Validates import dependencies
@@ -623,13 +665,20 @@ lint-check: ## Check the code (using ruff)
 
 .PHONY: lint-go
 lint-go:
-	cd server/log-collector && \
-		make lint
+	$(MAKE) -C server/go lint
 
 .PHONY: fmt-go
 fmt-go:
-	cd server/log-collector && \
-		make fmt
+	$(MAKE) -C server/go fmt
+
+.PHONY: vale-docs
+vale-docs: ## Run vale check for docs and sorts ignore.txt file
+	vale docs
+	@sort .github/styles/MLRun/ignore.txt -o .github/styles/MLRun/ignore.txt
+
+.PHONY: linkcheck
+linkcheck:
+	make -C docs/ linkcheck
 
 .PHONY: release
 release: ## Release a version
@@ -682,11 +731,22 @@ endif
 ifndef MLRUN_BC_TESTS_OPENAPI_OUTPUT_PATH
 	$(error MLRUN_BC_TESTS_OPENAPI_OUTPUT_PATH is undefined)
 endif
+	# Run tests for the base code
 	export MLRUN_HTTPDB__DSN='sqlite:////mlrun/db/mlrun.db?check_same_thread=false' && \
 	export MLRUN_OPENAPI_JSON_NAME=mlrun_bc_base_oai.json && \
-	python -m pytest -v --capture=no --disable-warnings --durations=100 $(MLRUN_BC_TESTS_BASE_CODE_PATH)/tests/api/api/test_docs.py::test_save_openapi_json && \
+	cd $(MLRUN_BC_TESTS_BASE_CODE_PATH) && \
+	pip install ./pipeline-adapters/mlrun-pipelines-kfp-common && \
+	pip install ./pipeline-adapters/mlrun-pipelines-kfp-v1-8 && \
+	python -m pytest -v --capture=no --disable-warnings --durations=100 server/py/services/api/tests/unit/api/test_docs.py::test_save_openapi_json && \
+	cd ..
+
+	# Run tests for the head code (feature branch)
 	export MLRUN_OPENAPI_JSON_NAME=mlrun_bc_head_oai.json && \
-	python -m pytest -v --capture=no --disable-warnings --durations=100 tests/api/api/test_docs.py::test_save_openapi_json && \
+	pip install ./pipeline-adapters/mlrun-pipelines-kfp-common && \
+	pip install ./pipeline-adapters/mlrun-pipelines-kfp-v1-8 && \
+	python -m pytest -v --capture=no --disable-warnings --durations=100 server/py/services/api/tests/unit/api/test_docs.py::test_save_openapi_json
+
+	# Run OpenAPI diff to check compatibility
 	docker run --rm -t -v $(MLRUN_BC_TESTS_OPENAPI_OUTPUT_PATH):/specs:ro openapitools/openapi-diff:latest /specs/mlrun_bc_base_oai.json /specs/mlrun_bc_head_oai.json --fail-on-incompatible
 
 
@@ -701,7 +761,14 @@ endif
 ifndef MLRUN_RELEASE_BRANCH
 	$(error MLRUN_RELEASE_BRANCH is undefined)
 endif
-	python ./automation/release_notes/generate.py run $(MLRUN_VERSION) $(MLRUN_OLD_VERSION) $(MLRUN_RELEASE_BRANCH) $(MLRUN_RAISE_ON_ERROR) $(MLRUN_RELEASE_NOTES_OUTPUT_FILE) $(MLRUN_SKIP_CLONE)
+	python ./automation/release_notes/generate.py \
+		run \
+		--release $(MLRUN_VERSION) \
+		--previous-release $(MLRUN_OLD_VERSION) \
+		--release-branch $(MLRUN_RELEASE_BRANCH) \
+		--raise-on-failed-parsing $(MLRUN_RAISE_ON_ERROR) \
+		--tmp-file-path $(MLRUN_RELEASE_NOTES_OUTPUT_FILE) \
+		--skip-clone $(MLRUN_SKIP_CLONE)
 
 
 .PHONY: pull-cache
@@ -717,3 +784,69 @@ ifdef MLRUN_DOCKER_CACHE_FROM_TAG
 	done;
     MLRUN_DOCKER_CACHE_FROM_FLAG := $(MLRUN_BASE_IMAGE_DOCKER_CACHE_FROM_FLAG)
 endif
+
+.PHONY: verify-uv-version
+verify-uv-version:
+	@{ \
+	uv_version=$$(uv version | cut -d' ' -f2); \
+	result=$$(python -m semver compare $$uv_version $(MLRUN_UV_VERSION)); \
+	if [ "$$result" -eq -1 ]; then \
+	  echo "Error: The running uv version ($$uv_version) is outdated. Upgrade uv to version $(MLRUN_UV_VERSION)."; \
+	  exit 1; \
+	fi; \
+	}
+
+.PHONY: upgrade-mlrun-api-deps-lock
+upgrade-mlrun-api-deps-lock: verify-uv-version ## Upgrade mlrun-api locked requirements file
+	uv pip compile \
+		requirements.txt \
+		extras-requirements.txt \
+		dockerfiles/mlrun-api/requirements.txt \
+		$(MLRUN_UV_UPGRADE_FLAG) \
+		--output-file dockerfiles/mlrun-api/locked-requirements.txt
+
+.PHONY: upgrade-mlrun-mlrun-deps-lock
+upgrade-mlrun-mlrun-deps-lock: verify-uv-version ## Upgrade mlrun-mlrun locked requirements file
+	uv pip compile \
+		requirements.txt \
+		extras-requirements.txt \
+		dockerfiles/mlrun/requirements.txt \
+		$(MLRUN_UV_UPGRADE_FLAG) \
+		--output-file dockerfiles/mlrun/locked-requirements.txt
+
+.PHONY: upgrade-mlrun-base-deps-lock
+upgrade-mlrun-base-deps-lock: verify-uv-version ## Upgrade mlrun-base locked requirements file
+	uv pip compile \
+		requirements.txt \
+		extras-requirements.txt \
+		dockerfiles/base/requirements.txt \
+		$(MLRUN_UV_UPGRADE_FLAG) \
+		--output-file dockerfiles/base/locked-requirements.txt
+
+.PHONY: upgrade-mlrun-gpu-deps-lock
+upgrade-mlrun-gpu-deps-lock: verify-uv-version ## Upgrade mlrun-gpu locked requirements file
+	uv pip compile \
+		requirements.txt \
+		extras-requirements.txt \
+		dockerfiles/mlrun/requirements.txt \
+		dockerfiles/base/requirements.txt \
+		$(MLRUN_UV_UPGRADE_FLAG) \
+		--output-file dockerfiles/gpu/locked-requirements.txt
+
+.PHONY: upgrade-mlrun-jupyter-deps-lock
+upgrade-mlrun-jupyter-deps-lock: verify-uv-version ## Upgrade mlrun-jupyter locked requirements file
+	uv pip compile \
+		requirements.txt \
+		extras-requirements.txt \
+		dockerfiles/jupyter/requirements.txt \
+		dockerfiles/mlrun-api/requirements.txt \
+		$(MLRUN_UV_UPGRADE_FLAG) \
+		--output-file dockerfiles/jupyter/locked-requirements.txt
+
+.PHONY: upgrade-mlrun-deps-lock
+upgrade-mlrun-deps-lock: verify-uv-version ## Upgrade mlrun-* locked requirements file
+upgrade-mlrun-deps-lock: upgrade-mlrun-mlrun-deps-lock
+upgrade-mlrun-deps-lock: upgrade-mlrun-api-deps-lock
+upgrade-mlrun-deps-lock: upgrade-mlrun-jupyter-deps-lock
+upgrade-mlrun-deps-lock: upgrade-mlrun-base-deps-lock
+upgrade-mlrun-deps-lock: upgrade-mlrun-gpu-deps-lock

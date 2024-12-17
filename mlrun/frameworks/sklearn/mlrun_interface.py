@@ -13,6 +13,7 @@
 # limitations under the License.
 #
 from abc import ABC
+from typing import Optional
 
 import mlrun
 
@@ -97,7 +98,7 @@ class SKLearnMLRunInterface(MLRunInterface, ABC):
 
         def wrapper(
             self: SKLearnTypes.ModelType,
-            X: SKLearnTypes.DatasetType,
+            X: SKLearnTypes.DatasetType,  # noqa: N803 - should be lowercase "x", kept for BC
             y: SKLearnTypes.DatasetType = None,
             *args,
             **kwargs,
@@ -124,7 +125,12 @@ class SKLearnMLRunInterface(MLRunInterface, ABC):
 
         return wrapper
 
-    def mlrun_predict(self, X: SKLearnTypes.DatasetType, *args, **kwargs):
+    def mlrun_predict(
+        self,
+        X: SKLearnTypes.DatasetType,  # noqa: N803 - should be lowercase "x", kept for BC
+        *args,
+        **kwargs,
+    ):
         """
         MLRun's wrapper for the common ML API predict method.
         """
@@ -136,7 +142,12 @@ class SKLearnMLRunInterface(MLRunInterface, ABC):
 
         return y_pred
 
-    def mlrun_predict_proba(self, X: SKLearnTypes.DatasetType, *args, **kwargs):
+    def mlrun_predict_proba(
+        self,
+        X: SKLearnTypes.DatasetType,  # noqa: N803 - should be lowercase "x", kept for BC
+        *args,
+        **kwargs,
+    ):
         """
         MLRun's wrapper for the common ML API predict_proba method.
         """
@@ -151,8 +162,8 @@ class SKLearnMLRunInterface(MLRunInterface, ABC):
     def configure_logging(
         self,
         context: mlrun.MLClientCtx = None,
-        plans: list[MLPlan] = None,
-        metrics: list[Metric] = None,
+        plans: Optional[list[MLPlan]] = None,
+        metrics: Optional[list[Metric]] = None,
         x_test: SKLearnTypes.DatasetType = None,
         y_test: SKLearnTypes.DatasetType = None,
         model_handler: MLModelHandler = None,

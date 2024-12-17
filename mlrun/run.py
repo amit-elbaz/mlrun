@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import importlib.util as imputil
 import json
 import os
@@ -20,6 +21,7 @@ import tempfile
 import time
 import typing
 import uuid
+import warnings
 from base64 import b64decode
 from copy import deepcopy
 from os import environ, makedirs, path
@@ -28,12 +30,15 @@ from typing import Optional, Union
 
 import nuclio
 import yaml
-from kfp import Client
 
+import mlrun.common.constants as mlrun_constants
+import mlrun.common.formatters
 import mlrun.common.schemas
 import mlrun.errors
 import mlrun.utils.helpers
-from mlrun.kfpops import format_summary_from_kfp_run, show_kfp_run
+from mlrun_pipelines.common.models import RunStatuses
+from mlrun_pipelines.common.ops import format_summary_from_kfp_run, show_kfp_run
+from mlrun_pipelines.utils import get_client
 
 from .common.helpers import parse_versioned_object_uri
 from .config import config as mlconf
@@ -47,7 +52,6 @@ from .runtimes import (
     KubejobRuntime,
     LocalRuntime,
     MpiRuntimeV1,
-    MpiRuntimeV1Alpha1,
     RemoteRuntime,
     RemoteSparkRuntime,
     RuntimeKinds,
@@ -60,48 +64,17 @@ from .runtimes.funcdoc import update_function_entry_points
 from .runtimes.nuclio.application import ApplicationRuntime
 from .runtimes.utils import add_code_metadata, global_context
 from .utils import (
+    RunKeys,
+    create_ipython_display,
     extend_hub_uri_if_needed,
     get_in,
     logger,
     retry_until_successful,
-    run_keys,
     update_in,
 )
 
-
-class RunStatuses:
-    succeeded = "Succeeded"
-    failed = "Failed"
-    skipped = "Skipped"
-    error = "Error"
-    running = "Running"
-
-    @staticmethod
-    def all():
-        return [
-            RunStatuses.succeeded,
-            RunStatuses.failed,
-            RunStatuses.skipped,
-            RunStatuses.error,
-            RunStatuses.running,
-        ]
-
-    @staticmethod
-    def stable_statuses():
-        return [
-            RunStatuses.succeeded,
-            RunStatuses.failed,
-            RunStatuses.skipped,
-            RunStatuses.error,
-        ]
-
-    @staticmethod
-    def transient_statuses():
-        return [
-            status
-            for status in RunStatuses.all()
-            if status not in RunStatuses.stable_statuses()
-        ]
+if typing.TYPE_CHECKING:
+    from mlrun.datastore import DataItem
 
 
 def function_to_module(code="", workdir=None, secrets=None, silent=False):
@@ -228,18 +201,19 @@ def load_func_code(command="", workdir=None, secrets=None, name="name"):
 def get_or_create_ctx(
     name: str,
     event=None,
-    spec=None,
+    spec: Optional[dict] = None,
     with_env: bool = True,
-    rundb: str = "",
+    rundb: Union[str, "mlrun.db.RunDBInterface"] = "",
     project: str = "",
-    upload_artifacts=False,
-    labels: dict = None,
-):
-    """called from within the user program to obtain a run context
+    upload_artifacts: bool = False,
+    labels: Optional[dict] = None,
+) -> MLClientCtx:
+    """
+    Called from within the user program to obtain a run context.
 
-    the run context is an interface for receiving parameters, data and logging
+    The run context is an interface for receiving parameters, data and logging
     run results, the run context is read from the event, spec, or environment
-    (in that order), user can also work without a context (local defaults mode)
+    (in that order), user can also work without a context (local defaults mode).
 
     all results are automatically stored in the "rundb" or artifact store,
     the path to the rundb can be specified in the call or obtained from env.
@@ -249,10 +223,10 @@ def get_or_create_ctx(
     :param spec:     dictionary holding run spec
     :param with_env: look for context in environment vars, default True
     :param rundb:    path/url to the metadata and artifact database
-    :param project:  project to initiate the context in (by default mlrun.mlctx.default_project)
+    :param project:  project to initiate the context in (by default `mlrun.mlconf.default_project`)
     :param upload_artifacts:  when using local context (not as part of a job/run), upload artifacts to the
                               system default artifact path location
-    :param labels:      dict of the context labels
+    :param labels: (deprecated - use spec instead) dict of the context labels.
     :return: execution context
 
     Examples::
@@ -285,6 +259,20 @@ def get_or_create_ctx(
         context.log_artifact("results.html", body=b"<b> Some HTML <b>", viewer="web-app")
 
     """
+    if labels:
+        warnings.warn(
+            "The `labels` argument is deprecated and will be removed in 1.9.0. "
+            "Please use `spec` instead, e.g.:\n"
+            "spec={'metadata': {'labels': {'key': 'value'}}}",
+            FutureWarning,
+        )
+        if spec is None:
+            spec = {}
+        if "metadata" not in spec:
+            spec["metadata"] = {}
+        if "labels" not in spec["metadata"]:
+            spec["metadata"]["labels"] = {}
+        spec["metadata"]["labels"].update(labels)
 
     if global_context.get() and not spec and not event:
         return global_context.get()
@@ -312,7 +300,7 @@ def get_or_create_ctx(
             artifact_path = mlrun.utils.helpers.template_artifact_path(
                 mlconf.artifact_path, project or mlconf.default_project
             )
-            update_in(newspec, ["spec", run_keys.output_path], artifact_path)
+            update_in(newspec, ["spec", RunKeys.output_path], artifact_path)
 
     newspec.setdefault("metadata", {})
     update_in(newspec, "metadata.name", name, replace=False)
@@ -321,18 +309,23 @@ def get_or_create_ctx(
     out = rundb or mlconf.dbpath or environ.get("MLRUN_DBPATH")
     if out:
         autocommit = True
-        logger.info(f"logging run results to: {out}")
+        logger.info(f"Logging run results to: {out}")
 
     newspec["metadata"]["project"] = (
         newspec["metadata"].get("project") or project or mlconf.default_project
     )
 
+    newspec["metadata"].setdefault("labels", {})
+
+    # This function can also be called as a local run if it is not called within a function.
+    # It will create a local run, and the run kind must be local by default.
+    newspec["metadata"]["labels"].setdefault(
+        mlrun_constants.MLRunInternalLabels.kind, RuntimeKinds.local
+    )
+
     ctx = MLClientCtx.from_dict(
         newspec, rundb=out, autocommit=autocommit, tmp=tmp, host=socket.gethostname()
     )
-    labels = labels or {}
-    for key, val in labels.items():
-        ctx.set_label(key=key, value=val)
     global_context.set(ctx)
     return ctx
 
@@ -444,7 +437,7 @@ def new_function(
     mode: Optional[str] = None,
     handler: Optional[str] = None,
     source: Optional[str] = None,
-    requirements: Union[str, list[str]] = None,
+    requirements: Optional[Union[str, list[str]]] = None,
     kfp: Optional[bool] = None,
     requirements_file: str = "",
 ):
@@ -606,7 +599,6 @@ def code_to_function(
     ignored_tags: Optional[str] = None,
     requirements_file: Optional[str] = "",
 ) -> Union[
-    MpiRuntimeV1Alpha1,
     MpiRuntimeV1,
     RemoteRuntime,
     ServingRuntime,
@@ -661,11 +653,10 @@ def code_to_function(
     :param embed_code:   indicates whether or not to inject the code directly into the function runtime spec,
                          defaults to True
     :param description:  short function description, defaults to ''
-    :param requirements: list of python packages or pip requirements file path, defaults to None
     :param requirements: a list of python packages
     :param requirements_file: path to a python requirements file
     :param categories:   list of categories for mlrun Function Hub, defaults to None
-    :param labels:       immutable name/value pairs to tag the function with useful metadata, defaults to None
+    :param labels:       name/value pairs dict to tag the function with useful metadata, defaults to None
     :param with_doc:     indicates whether to document the function parameters, defaults to True
     :param ignored_tags: notebook cells to ignore when converting notebooks to py code (separated by ';')
 
@@ -757,11 +748,10 @@ def code_to_function(
         raise ValueError("Databricks tasks only support embed_code=True")
 
     if kind == RuntimeKinds.application:
-        if handler:
-            raise MLRunInvalidArgumentError(
-                "Handler is not supported for application runtime"
-            )
-        filename, handler = ApplicationRuntime.get_filename_and_handler()
+        raise MLRunInvalidArgumentError(
+            "Embedding a code file is not supported for application runtime. "
+            "Code files should be specified via project/function source."
+        )
 
     is_nuclio, sub_kind = RuntimeKinds.resolve_nuclio_sub_kind(kind)
     code_origin = add_name(add_code_metadata(filename), name)
@@ -804,6 +794,10 @@ def code_to_function(
             raise ValueError("code_output option is only used with notebooks")
 
     if is_nuclio:
+        mlrun.utils.helpers.validate_single_def_handler(
+            function_kind=sub_kind, code=code
+        )
+
         runtime = RuntimeKinds.resolve_nuclio_runtime(kind, sub_kind)
         # default_handler is only used in :mlrun sub kind, determine the handler to invoke in function.run()
         runtime.spec.default_handler = handler if sub_kind == "mlrun" else ""
@@ -915,13 +909,53 @@ def _run_pipeline(
     return pipeline_run_id
 
 
+def retry_pipeline(
+    run_id: str,
+    project: Optional[str] = None,
+    namespace: Optional[str] = None,
+) -> str:
+    """Retry a pipeline run.
+
+    This function retries a previously executed pipeline run using the specified run ID. If the run is not in a
+    retryable state, a new run is created as a clone of the original run.
+
+    :param run_id: ID of the pipeline run to retry.
+    :param project: Optional; name of the project associated with the pipeline run.
+    :param namespace: Optional; Kubernetes namespace to use if not the default.
+
+    :returns: ID of the retried pipeline run or the ID of a cloned run if the original run is not retryable.
+    :raises ValueError: If access to the remote API service is not available.
+    """
+    mldb = mlrun.db.get_run_db()
+    if mldb.kind != "http":
+        raise ValueError(
+            "Retrying a pipeline requires access to remote API service. "
+            "Please set the dbpath URL."
+        )
+
+    pipeline_run_id = mldb.retry_pipeline(
+        run_id=run_id,
+        project=project,
+        namespace=namespace,
+    )
+    if pipeline_run_id == run_id:
+        logger.info(
+            f"Retried pipeline run ID={pipeline_run_id}, check UI for progress."
+        )
+    else:
+        logger.info(
+            f"Copy of pipeline {run_id} was retried as run ID={pipeline_run_id}, check UI for progress."
+        )
+    return pipeline_run_id
+
+
 def wait_for_pipeline_completion(
     run_id,
     timeout=60 * 60,
-    expected_statuses: list[str] = None,
+    expected_statuses: Optional[list[str]] = None,
     namespace=None,
     remote=True,
-    project: str = None,
+    project: Optional[str] = None,
 ):
     """Wait for Pipeline status, timeout in sec
 
@@ -951,10 +985,12 @@ def wait_for_pipeline_completion(
     if remote:
         mldb = mlrun.db.get_run_db()
 
+        dag_display_id = create_ipython_display()
+
         def _wait_for_pipeline_completion():
             pipeline = mldb.get_pipeline(run_id, namespace=namespace, project=project)
             pipeline_status = pipeline["run"]["status"]
-            show_kfp_run(pipeline, clear_output=True)
+            show_kfp_run(pipeline, dag_display_id=dag_display_id, with_html=False)
             if pipeline_status not in RunStatuses.stable_statuses():
                 logger.debug(
                     "Waiting for pipeline completion",
@@ -979,7 +1015,7 @@ def wait_for_pipeline_completion(
             _wait_for_pipeline_completion,
         )
     else:
-        client = Client(namespace=namespace)
+        client = get_client(namespace=namespace)
         resp = client.wait_for_run_completion(run_id, timeout)
         if resp:
             resp = resp.to_dict()
@@ -1009,9 +1045,9 @@ def get_pipeline(
     run_id,
     namespace=None,
     format_: Union[
-        str, mlrun.common.schemas.PipelinesFormat
-    ] = mlrun.common.schemas.PipelinesFormat.summary,
-    project: str = None,
+        str, mlrun.common.formatters.PipelineFormat
+    ] = mlrun.common.formatters.PipelineFormat.summary,
+    project: Optional[str] = None,
     remote: bool = True,
 ):
     """Get Pipeline status
@@ -1024,7 +1060,7 @@ def get_pipeline(
     :param project:    the project of the pipeline run
     :param remote:     read kfp data from mlrun service (default=True)
 
-    :return: kfp run dict
+    :return: kfp run
     """
     namespace = namespace or mlconf.namespace
     if remote:
@@ -1040,15 +1076,15 @@ def get_pipeline(
         )
 
     else:
-        client = Client(namespace=namespace)
+        client = get_client(namespace=namespace)
         resp = client.get_run(run_id)
         if resp:
             resp = resp.to_dict()
             if (
                 not format_
-                or format_ == mlrun.common.schemas.PipelinesFormat.summary.value
+                or format_ == mlrun.common.formatters.PipelineFormat.summary.value
             ):
-                resp = format_summary_from_kfp_run(resp)
+                resp = mlrun.common.formatters.PipelineFormat.format_obj(resp, format_)
 
     show_kfp_run(resp)
     return resp
@@ -1062,7 +1098,7 @@ def list_pipelines(
     filter_="",
     namespace=None,
     project="*",
-    format_: mlrun.common.schemas.PipelinesFormat = mlrun.common.schemas.PipelinesFormat.metadata_only,
+    format_: mlrun.common.formatters.PipelineFormat = mlrun.common.formatters.PipelineFormat.metadata_only,
 ) -> tuple[int, Optional[int], list[dict]]:
     """List pipelines
 
@@ -1082,7 +1118,7 @@ def list_pipelines(
     :param format_:    Control what will be returned (full/metadata_only/name_only)
     """
     if full:
-        format_ = mlrun.common.schemas.PipelinesFormat.full
+        format_ = mlrun.common.formatters.PipelineFormat.full
     run_db = mlrun.db.get_run_db()
     pipelines = run_db.list_pipelines(
         project, namespace, sort_by, page_token, filter_, format_, page_size
@@ -1096,7 +1132,7 @@ def get_object(url, secrets=None, size=None, offset=0, db=None):
     return stores.object(url=url).get(size, offset)
 
 
-def get_dataitem(url, secrets=None, db=None) -> mlrun.datastore.DataItem:
+def get_dataitem(url, secrets=None, db=None) -> "DataItem":
     """get mlrun dataitem object (from path/url)"""
     stores = store_manager.set(secrets, db=db)
     return stores.object(url=url)
@@ -1151,7 +1187,7 @@ def wait_for_runs_completion(
         running = []
         for run in runs:
             state = run.state()
-            if state in mlrun.runtimes.constants.RunStates.terminal_states():
+            if state in mlrun.common.runtimes.constants.RunStates.terminal_states():
                 completed.append(run)
             else:
                 running.append(run)

@@ -45,7 +45,7 @@ RUN git config --global user.email "test@mlrun.org" \
      && git config --global user.name "MLRun Test" \
      && git config --global init.defaultBranch "main"
 
-ARG MLRUN_PIP_VERSION=23.2.1
+ARG MLRUN_PIP_VERSION=24.2
 RUN python -m pip install --upgrade pip~=${MLRUN_PIP_VERSION}
 
 WORKDIR /mlrun
@@ -56,7 +56,7 @@ COPY ./dockerfiles/mlrun-api/requirements.txt ./mlrun-api-requirements.txt
 COPY ./dev-requirements.txt ./
 COPY ./docs/requirements.txt ./docs-requirements.txt
 
-RUN pip install \
+RUN python -m pip install \
     -r requirements.txt \
     -r extras-requirements.txt \
     -r mlrun-api-requirements.txt
@@ -73,6 +73,10 @@ RUN python -m pip install \
 
 COPY . .
 
-RUN pip install -e .[complete]
+ARG MLRUN_PIPELINES_KFP_VERSION=1-8
+
+RUN python -m pip install -e .[complete] && \
+    python -m pip install -e ./pipeline-adapters/mlrun-pipelines-kfp-common && \
+    python -m pip install -e ./pipeline-adapters/mlrun-pipelines-kfp-v${MLRUN_PIPELINES_KFP_VERSION}
 
 ENV NO_COLOR=1

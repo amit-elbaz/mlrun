@@ -12,12 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# flake8: noqa  - this is until we take care of the F401 violations with respect to __all__ & sphinx
-
 import mlrun
 import mlrun.artifacts
 from mlrun.config import config
-from mlrun.utils.helpers import is_legacy_artifact, parse_artifact_uri
+from mlrun.utils.helpers import parse_artifact_uri
 
 from ..common.helpers import parse_versioned_object_uri
 from ..platforms.iguazio import parse_path
@@ -27,6 +25,8 @@ from .targets import get_online_target
 
 def is_store_uri(url):
     """detect if the uri starts with the store schema prefix"""
+    if not url:
+        return False
     return url.startswith(DB_SCHEMA + "://")
 
 
@@ -146,7 +146,11 @@ def get_store_resource(
 
     db = db or mlrun.get_run_db(secrets=secrets)
     kind, uri = parse_store_uri(uri)
-    if kind == StorePrefix.FeatureSet:
+    if not kind:
+        raise mlrun.errors.MLRunInvalidArgumentError(
+            f"Cannot get store resource from invalid URI: {uri}"
+        )
+    elif kind == StorePrefix.FeatureSet:
         project, name, tag, uid = parse_versioned_object_uri(
             uri, project or config.default_project
         )
@@ -159,19 +163,20 @@ def get_store_resource(
         return db.get_feature_vector(name, project, tag, uid)
 
     elif StorePrefix.is_artifact(kind):
-        project, key, iteration, tag, tree = parse_artifact_uri(
+        project, key, iteration, tag, tree, uid = parse_artifact_uri(
             uri, project or config.default_project
         )
         resource = db.read_artifact(
-            key, project=project, tag=tag, iter=iteration, tree=tree
+            key,
+            project=project,
+            tag=tag,
+            iter=iteration,
+            tree=tree,
+            uid=uid,
         )
         if resource.get("kind", "") == "link":
             # todo: support other link types (not just iter, move this to the db/api layer
-            link_iteration = (
-                resource.get("link_iteration", 0)
-                if is_legacy_artifact(resource)
-                else resource["spec"].get("link_iteration", 0)
-            )
+            link_iteration = resource["spec"].get("link_iteration", 0)
 
             resource = db.read_artifact(
                 key,
